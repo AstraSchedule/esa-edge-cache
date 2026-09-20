@@ -26,10 +26,23 @@ version = <dataVersion>:<weekNumber>[:<boundary>]
 | 班级条目 | `s1.<host>.<base64url(班级路径)>` | 一个班级一条 |
 | 世代 | `g1.<host>` | 一个域名一条 |
 
-键里带 hostname 不是装饰：**namespace 由 Host 推导**（usr-backend 的
-`middleware.ParseHostToNamespace`，`aaa-do.getastra.cn` → `cn/getastra/aaa-do`），
-所以每个租户子域都是一套独立数据。同一个班级路径在不同子域下必须落到不同的键上，
-反过来同一个子域的世代键也必须只失效它自己——这也是写请求按 host 推进世代的原因。
+键里带 hostname 不是装饰，它是**唯一**区分租户的东西。后端的 namespace 完全由
+**Host 头**推导（usr-backend 的 `middleware.ParseHostToNamespace`：
+先用 `net.SplitHostPort` 剥端口，再把域名标签反转成 `cn/getastra/class`），
+所以边缘缓存的键必须与这个输入**逐字对齐**，对齐错了就是把 A 租户的版本当成 B 租户的。
+
+据此定了三条（见 `src/index.js` 的 `hostOf`）：
+
+| 规则 | 原因 |
+|---|---|
+| 读 **Host 头**，不用 `url.hostname` | 后者经 WHATWG URL 规范化会做**小写折叠**，而后端不做；大小写不同在后端就是两个 namespace |
+| **剥掉端口** | 与 `net.SplitHostPort` 对齐：`class.getastra.cn:8443` 与 `class.getastra.cn` 是同一个 namespace，且冒号不是 KV 允许的键字符 |
+| 只**校验**、不**清洗** | 清洗（小写化、剔除非法字符）是**有损**的，会让两个不同的 Host 落到同一个键上。非法主机名一律返回 null、直接透传、不缓存 |
+
+最后一条是这里最容易写错的地方：一个「顺手 sanitize 一下」的实现会把
+`cl@ass.getastra.cn` 洗成 `class.getastra.cn`，让它命中别人的缓存。
+反过来，键比 namespace 更细（比如按 IP 分开）只会多几次回源，不会串数据——
+**宁可过细，不可过粗**。
 
 `base64url` 是对 UTF-8 字节的编码（字母表 `A-Za-z0-9-_`，无填充）。
 班级路径必须编码，因为 ESA 边缘 KV 的键**拒绝非 ASCII**（实测：键 `中文键` 返回
@@ -179,6 +192,11 @@ KV 写入最迟 300 秒同步到全球节点。也就是说：管理端改完课
    （SaaS 是 serverless 模式，WebSocket 本身返回 501）。
 6. `esa.jsonc` 只写 `entry`、不写 `assets` 时，ESA 接受这个配置并把项目当作纯函数
    （而不是因为缺 `assets` 报错）。若被拒，退路是补一个空的静态资源目录。
+7. **函数拿到的 `Host` 头就是客户端原始的那一个**，而且 `fetch(request)` 回源时会原样带给 FC。
+   这一点是整个 namespace 隔离的前提：边缘按它分组缓存，FC 按它选命名空间，两边必须是同一个值。
+   如果 ESA 在中间改写了 Host（比如换成 Pages 的默认域名），所有租户会塌进同一个 namespace，
+   缓存就会串数据。**这条必须最先验证**——用一个非生产租户域名发一次请求，
+   看 FC 日志里的命名空间是不是该租户。
 
 ### 已完成的键格式实测
 

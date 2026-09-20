@@ -35,6 +35,9 @@ const HEADER_EXPIRE = 'X-Astra-Schedule-Expire';
 /** 版本串的合法字符与长度上限，防止异常响应把任意内容写进 KV */
 const VERSION_PATTERN = /^[0-9A-Za-z:._-]{1,128}$/;
 
+/** 合法主机名。用于「校验」而不是「清洗」——清洗是有损的，见 hostOf 的注释 */
+const HOSTNAME_PATTERN = /^[A-Za-z0-9.-]{1,253}$/;
+
 /**
  * 会改变服务端数据的请求方法，只有这些方法成功后才推进世代。
  * 这里用白名单而不是「非 GET/HEAD 就失效」：浏览器的跨域预检用的是 OPTIONS，
@@ -55,18 +58,22 @@ export default {
 async function handleRequest(request) {
 	const method = String(request.method || 'GET').toUpperCase();
 
-	// url 要在 fetch 之前取：请求体交给 fetch 之后 request 可能已不可再被读取。
-	// 取 hostname 而不是 host：host 会带上非默认端口（如 :8443），而冒号不是边缘 KV 允许的键字符
+	// url 要在 fetch 之前取：请求体交给 fetch 之后 request 可能已不可再被读取
 	const url = new URL(request.url);
-	const host = url.hostname;
+	const host = hostOf(request, url.hostname);
 
 	// GET 之外一律透传（含 HEAD 与跨域预检 OPTIONS），只有会改数据的方法才推进世代
 	if (method !== 'GET') {
 		const response = await fetch(request);
-		if (MUTATING_METHODS.has(method) && isSuccess(response.status)) {
+		if (host !== null && MUTATING_METHODS.has(method) && isSuccess(response.status)) {
 			await invalidateHost(host);
 		}
 		return response;
+	}
+
+	// 主机名缺失或不合法 → 无法推出后端用的 namespace，一律不缓存
+	if (host === null) {
+		return fetch(request);
 	}
 
 	const classId = classIdOf(url.pathname);
@@ -127,10 +134,13 @@ function classIdOf(pathname) {
 
 /**
  * 班级条目的键：s1.<host>.<base64url(班级路径)>
- * host 只含 [a-z0-9.-]，班级路径可能含中文（ESA 边缘 KV 拒绝非 ASCII 键），因此做 base64url 编码。
+ *
+ * host 就是后端推导 namespace 用的那个值（见 hostOf），必须原样使用、不得折叠；
+ * 班级路径可能含非 ASCII（ESA 边缘 KV 拒绝非 ASCII 键），因此做 base64url 编码。
+ * 调用方保证 host 已经过 hostOf 校验。
  */
 function entryKeyOf(host, classId) {
-	return ENTRY_KEY_PREFIX + normalizeHost(host) + '.' + base64url(classId);
+	return ENTRY_KEY_PREFIX + host + '.' + base64url(classId);
 }
 
 /**
@@ -140,11 +150,32 @@ function entryKeyOf(host, classId) {
  * 也覆盖了 /web/autorun、/web/countdown 这类一次影响多个班级的全局写入。
  */
 function genKeyOf(host) {
-	return GEN_KEY_PREFIX + normalizeHost(host);
+	return GEN_KEY_PREFIX + host;
 }
 
-function normalizeHost(host) {
-	return String(host || '').toLowerCase().replace(/[^a-z0-9.-]/g, '');
+/**
+ * 取「后端用来推导 namespace 的那个 host」。
+ *
+ * 后端的 namespace 完全由 **Host 头**推导（usr-backend 的 middleware.ParseHostToNamespace：
+ * 先用 net.SplitHostPort 剥掉端口，再把域名标签反转成 cn/getastra/class）。
+ * 边缘缓存的键必须与这个输入逐字对齐，否则就会把 A 租户的版本当成 B 租户的——
+ * 也就是跨 namespace 串数据。
+ *
+ * 三点据此而定：
+ *   - 读 **Host 头**而不是 url.hostname：后者经过 WHATWG URL 规范化，会做小写折叠，
+ *     而后端不做。大小写不同在后端就是两个不同的 namespace，边缘不能把它们并成一个键。
+ *   - **剥掉端口**：与 net.SplitHostPort 对齐。带端口的 Host 与不带端口的是同一个 namespace，
+ *     而且冒号也不是边缘 KV 允许的键字符。
+ *   - 只**校验**不**清洗**：小写化、剔除非法字符这类清洗都是有损的，会让两个不同的 host
+ *     落到同一个键上（跨租户），所以非法值一律返回 null，交由调用方透传、不缓存。
+ */
+function hostOf(request, fallbackHostname) {
+	const raw = String(request.headers.get('host') || fallbackHostname || '').trim();
+	if (raw === '') {
+		return null;
+	}
+	const host = raw.includes(':') ? raw.slice(0, raw.lastIndexOf(':')) : raw;
+	return HOSTNAME_PATTERN.test(host) ? host : null;
 }
 
 function createStore() {
@@ -345,6 +376,7 @@ export {
 	classIdOf,
 	entryKeyOf,
 	genKeyOf,
+	hostOf,
 	isFresh,
 	notModified,
 	parseExpire,

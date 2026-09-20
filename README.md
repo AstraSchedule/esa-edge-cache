@@ -26,9 +26,11 @@ ESA 边缘 KV，客户端带着本地 `version` 回来时直接在边缘回 304�
   班级条目里记下写入时的世代，读取时二者必须一致。一次写入就能让该域名下所有班级失效，
   不必枚举键（边缘 KV 没有前缀枚举能力），也覆盖了 `/web/autorun` 这类一次影响多个班级的全局写入。
 - **缓存是纯优化**：KV 不可用、抛异常、格式不认识、请求带 `Origin` 时一律降级为直接回源。
-- **按 hostname 分租户**：namespace 由 Host 推导，所以函数要覆盖 `getastra.cn` 下
-  **除 `i.` / `sys.` / `dev.` / `go.` / `to.` / 裸域 / `www.` 之外**的全部子域，
-  键与世代都按 hostname 隔离。详见 `docs/deploy.md` 第 3 节。
+- **按 Host 头分租户**：后端 namespace 由 Host 推导
+  （`ParseHostToNamespace`：剥端口 → 反转域名标签，**不做大小写折叠**），
+  所以边缘缓存键直接取 **Host 头原值**（剥端口、只校验不清洗），键与世代都按它隔离。
+  函数要覆盖 `getastra.cn` 下**除 `i.` / `sys.` / `dev.` / `go.` / `to.` / 裸域 / `www.` 之外**
+  的全部子域。详见 `docs/design.md` 第 2 节。
 
 详细的取舍、平台限制实测结果与已知风险见 [`docs/design.md`](docs/design.md)。
 

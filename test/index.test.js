@@ -4,6 +4,7 @@ import edgeCache, {
 	classIdOf,
 	entryKeyOf,
 	genKeyOf,
+	hostOf,
 	parseExpire,
 	readMeta,
 } from '../src/index.js';
@@ -123,9 +124,10 @@ describe('KV 键', () => {
 		expect(/^[0-9A-Za-z_-]+$/.test(base64url(input))).toBe(true);
 	});
 
-	test('世代键按 host 隔离', () => {
+	test('世代键按 host 隔离，且不做大小写折叠', () => {
 		expect(genKeyOf(HOST)).toBe('g1.' + HOST);
-		expect(genKeyOf('AAA.GetAstra.CN')).toBe('g1.aaa.getastra.cn');
+		// 后端 ParseHostToNamespace 不做小写折叠，边缘不能自作主张把两者并成一个键
+		expect(genKeyOf('AAA.GetAstra.CN')).toBe('g1.AAA.GetAstra.CN');
 	});
 });
 
@@ -412,5 +414,86 @@ describe('回归：只读方法与键字符集', () => {
 
 		expect(response.status).toBe(200);
 		expect(kv.data.size).toBe(0);
+	});
+});
+
+// 后端的 namespace 完全由 **Host 头**推导（usr-backend middleware.ParseHostToNamespace：
+// 先剥端口、再把域名标签反转成 cn/getastra/class，且不做大小写折叠）。
+// 边缘缓存的键必须与这个输入逐字对齐——对齐错了就是把 A 租户的版本当成 B 租户的。
+describe('namespace 隔离（键必须与后端 Host 推导对齐）', () => {
+	// 用最小桩直接喂 Host 头：Request 的 host 头在部分运行时不可设置
+	const withHost = (host) => ({
+		headers: { get: (name) => (String(name).toLowerCase() === 'host' ? host : null) },
+	});
+
+	test('hostOf 剥端口、保留大小写、拒绝非法值', () => {
+		expect(hostOf(withHost('class.getastra.cn'), 'x')).toBe('class.getastra.cn');
+		expect(hostOf(withHost('CLASS.getastra.cn'), 'x')).toBe('CLASS.getastra.cn');
+		expect(hostOf(withHost('class.getastra.cn:8443'), 'x')).toBe('class.getastra.cn');
+		expect(hostOf(withHost('  class.getastra.cn  '), 'x')).toBe('class.getastra.cn');
+		expect(hostOf(withHost('bad host'), 'x')).toBe(null);
+		expect(hostOf(withHost('evil/x'), 'x')).toBe(null);
+		expect(hostOf(withHost('[::1]:443'), 'x')).toBe(null);
+		expect(hostOf(withHost(''), 'fallback.getastra.cn')).toBe('fallback.getastra.cn');
+		expect(hostOf(withHost(null), '')).toBe(null);
+	});
+
+	test('键的推导必须无歧义：不同 Host 绝不能落到同一个键', () => {
+		// 这条用例咬的是「有损清洗」这个缺陷：旧实现是
+		//   host.toLowerCase().replace(/[^a-z0-9.-]/g, '')
+		// 而清洗是有损的——CLASS.getastra.cn 与 class.getastra.cn 会撞成一个键，
+		// cl\@ass.getastra.cn 会被清洗成 class.getastra.cn 落进别人的缓存。
+		// 这三者在后端是三个不同的 namespace，边缘必须给三个不同的键、或者干脆不缓存。
+		const keyOf = (host) => {
+			const h = hostOf(withHost(host), '');
+			return h === null ? null : entryKeyOf(h, '39/2023/1');
+		};
+
+		expect(keyOf('cl@ass.getastra.cn')).toBe(null, '非法主机名必须被拒，而不是清洗后落进别人的键');
+		expect(keyOf('bad host')).toBe(null);
+
+		const keys = ['class.getastra.cn', 'CLASS.getastra.cn', 'njx.getastra.cn'].map(keyOf);
+		expect(keys.filter((k) => k !== null)).toHaveLength(3);
+		expect(new Set(keys).size).toBe(3, '三个不同 namespace 必须是三个不同的键');
+	});
+
+	test('不同 host 的同名班级不共用缓存条目', async () => {
+		await edgeCache.fetch(
+			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
+		);
+		origin.length = 0;
+
+		const other = await edgeCache.fetch(
+			new Request('https://njx.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
+		);
+
+		expect(other.status).toBe(200, '另一个租户不该命中 class 的缓存');
+		expect(origin).toHaveLength(1);
+		expect(kv.data.has(entryKeyOf('class.getastra.cn', '39/2023/1'))).toBe(true);
+		expect(kv.data.has(entryKeyOf('njx.getastra.cn', '39/2023/1'))).toBe(true);
+	});
+
+	test('写请求只推进自己那个 host 的世代', async () => {
+		await edgeCache.fetch(
+			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
+		);
+
+		origin = installOrigin(() => new Response('ok', { status: 200 }));
+		await edgeCache.fetch(
+			new Request('https://njx.getastra.cn/web/config/2023/1/1/schedule', {
+				method: 'PUT',
+				body: '{}',
+			}),
+		);
+
+		expect(kv.data.has(genKeyOf('njx.getastra.cn'))).toBe(true);
+		expect(kv.data.has(genKeyOf('class.getastra.cn'))).toBe(false, '不该波及别的租户');
+
+		origin = installOrigin(() => scheduleResponse());
+		const after = await edgeCache.fetch(
+			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
+		);
+		expect(after.status).toBe(304);
+		expect(origin).toHaveLength(0);
 	});
 });
