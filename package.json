@@ -1,0 +1,10 @@
+{
+  "name": "esa-edge-cache",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "星程课表 ESA 边缘版本缓存（边缘函数 + 边缘 KV）",
+  "scripts": {
+    "test": "bun test"
+  }
+}
