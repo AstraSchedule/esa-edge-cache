@@ -1,0 +1,6 @@
+{
+  "name": "esa-edge-cache",
+  "entry": "./src/index.js",
+  "installCommand": "",
+  "buildCommand": ""
+}
