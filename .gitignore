@@ -1,3 +1,6 @@
 node_modules/
 dist/
 *.log
+
+# esa-cli 本地打包产物（deploy 时自动生成，不上传也不提交）
+.dev/
