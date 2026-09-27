@@ -1,24 +1,38 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import edgeCache, {
+import edgeWeather, {
 	base64url,
-	classIdOf,
-	entryKeyOf,
-	genKeyOf,
-	hostOf,
-	parseExpire,
-	readMeta,
+	buildWeatherBody,
+	cacheKeyOf,
+	geoQueryOf,
+	readConfig,
+	weatherQueryOf,
 } from '../src/index.js';
 
+const QW_HOST = 'qu7qqnuwvp.re.qweatherapi.com';
+const QW_KEY = 'test-api-key';
+const ENV = { QW_API_HOST: QW_HOST, QW_API_KEY: QW_KEY };
 const HOST = 'class.getastra.cn';
-const CLASS_PATH = '/39/2023/1';
-const VERSION = '1758300000:12:1758384000';
+const CITY = '北京';
+const ADM = '北京市';
 // 相对当前时间取未来时刻：过期判定用的是边缘节点的真实时钟，写死时间戳会在将来变成「已过期」
-const EXPIRE = Math.floor(Date.now() / 1000) + 3600;
+const FUTURE = () => Math.floor(Date.now() / 1000) + 3600;
+
+/** 和风天气三个接口的真实响应片段（字段名与 QWeather v7 / geo v2 / weatheralert v1 一致） */
+const LOCATION_BODY = {
+	code: '200',
+	location: [{ id: '101010100', lat: '39.90499', lon: '116.40529', name: '北京' }],
+};
+const NOW_BODY = {
+	code: '200',
+	now: { temp: '21', text: '晴', windDir: '东南风', windScale: '1' },
+};
+const ALERT_BODY = {
+	alerts: [{ description: '高温\n预警', headline: '高温预警' }],
+};
 
 /** 记录 KV 操作的内存实现，模拟 ESA 边缘 KV（get/put/delete + namespace 绑定） */
 function installKv(options = {}) {
 	const data = new Map();
-	const calls = [];
 	const namespaces = [];
 	class FakeEdgeKV {
 		constructor(config) {
@@ -26,14 +40,12 @@ function installKv(options = {}) {
 			this.namespace = config && config.namespace;
 		}
 		async get(key) {
-			calls.push({ op: 'get', key });
 			if (options.failGet) {
 				throw new Error('kv get failed');
 			}
 			return data.has(key) ? data.get(key) : undefined;
 		}
 		async put(key, value) {
-			calls.push({ op: 'put', key, value });
 			if (options.failPut) {
 				throw new Error('kv put failed');
 			}
@@ -45,47 +57,64 @@ function installKv(options = {}) {
 		}
 	}
 	globalThis.EdgeKV = FakeEdgeKV;
-	return { data, calls, namespaces };
+	return { data, namespaces };
 }
 
-/** 安装假的源站，返回记录下来的请求列表 */
-function installOrigin(handler) {
-	const requests = [];
-	globalThis.fetch = async (request) => {
-		requests.push({
-			url: request.url,
-			method: request.method,
-			headers: request.headers,
-		});
-		return handler(request, requests.length);
-	};
-	return requests;
-}
-
-function scheduleResponse(version = VERSION, expire = EXPIRE) {
-	return new Response(JSON.stringify({ version, week_number: 12 }), {
+function jsonResponse(body) {
+	return new Response(JSON.stringify(body), {
 		status: 200,
-		headers: {
-			'content-type': 'application/json; charset=utf-8',
-			'X-Astra-Schedule-Version': version,
-			'X-Astra-Schedule-Expire': String(expire),
-		},
+		headers: { 'content-type': 'application/json' },
 	});
 }
 
-function getRequest(query = '?version=' + encodeURIComponent(VERSION), init = {}) {
-	return new Request('https://' + HOST + CLASS_PATH + query, init);
+/**
+ * 安装假的 fetch：和风天气那三个接口按 path 命中 qweather 处理器，
+ * 其余一律记成「回源」，与真实环境里 fetch(request) 打到源站 FC 对应。
+ *
+ * 记录数组固定在 out 上、由 installFetch 清空后复用：测试里重新安装时不会丢记录。
+ */
+function installFetch(qweather) {
+	out.upstream.length = 0;
+	out.origin.length = 0;
+	globalThis.fetch = async (input, init) => {
+		const url = typeof input === 'string' ? input : input.url;
+		// 上游那三个请求用的是 fetch(url, { headers })，回源用的是 fetch(request)
+		const headers = new Headers(
+			(init && init.headers) || (typeof input === 'string' ? undefined : input.headers),
+		);
+		if (url.startsWith('https://' + QW_HOST)) {
+			out.upstream.push({ url, headers });
+			return qweather(url, out.upstream.length);
+		}
+		out.origin.push({ url, request: input });
+		return new Response('origin', { status: 200 });
+	};
 }
 
-const future = () => Math.floor(Date.now() / 1000) + 600;
-const past = () => Math.floor(Date.now() / 1000) - 600;
+const defaultQweather = (url) => {
+	if (url.includes('/geo/v2/city/lookup')) return jsonResponse(LOCATION_BODY);
+	if (url.includes('/v7/weather/now')) return jsonResponse(NOW_BODY);
+	return jsonResponse(ALERT_BODY);
+};
+
+function request(path, init = {}, info) {
+	const req = new Request('https://' + HOST + path, init);
+	if (info !== undefined) {
+		// ESA 运行时会在 request 上挂 `info`（客户端 IP/地域），这里照原样模拟
+		req.info = info;
+	}
+	return req;
+}
+
+const weatherPath = '/api/weather/' + encodeURIComponent(CITY);
+const weatherPathWithAdm = weatherPath + '/' + encodeURIComponent(ADM);
 
 let kv;
-let origin;
+const out = { upstream: [], origin: [] };
 
 beforeEach(() => {
 	kv = installKv();
-	origin = installOrigin(() => scheduleResponse());
+	installFetch(defaultQweather);
 });
 
 afterEach(() => {
@@ -93,407 +122,380 @@ afterEach(() => {
 	delete globalThis.fetch;
 });
 
-describe('班级路径识别', () => {
-	test('三段路径识别为班级，其余一律不处理', () => {
-		expect(classIdOf('/39/2023/1')).toBe('39/2023/1');
-		expect(classIdOf('/某某中学/2023级/1班')).toBe('某某中学/2023级/1班');
-		expect(classIdOf('/')).toBe(null);
-		expect(classIdOf('/39/2023')).toBe(null);
-		expect(classIdOf('/39/2023/1/schedule')).toBe(null);
-		expect(classIdOf('/web/config/2023')).toBe(null);
-		expect(classIdOf('/api/weather/beijing')).toBe(null);
+async function call(req = request(weatherPath), env = ENV) {
+	return edgeWeather.fetch(req, {}, env);
+}
+
+describe('路径识别', () => {
+	test('只认 /api/weather/<城市>[/<省份>]，且按 UTF-8 解码', () => {
+		expect(weatherQueryOf('/api/weather/%E5%8C%97%E4%BA%AC')).toEqual({
+			name: '北京',
+			adm: '',
+		});
+		expect(weatherQueryOf('/api/weather/%E5%8C%97%E4%BA%AC/%E5%8C%97%E4%BA%AC%E5%B8%82')).toEqual({
+			name: '北京',
+			adm: '北京市',
+		});
+		// 未编码的中文（测试/手工 curl 可能这么打）也要能认出来
+		expect(weatherQueryOf('/api/weather/北京')).toEqual({ name: '北京', adm: '' });
+	});
+
+	test('两段的 /api/weather/ 识别为「不带城市」，其余路径不接管', () => {
+		expect(weatherQueryOf('/api/weather/')).toEqual({ name: '', adm: '' });
+		expect(weatherQueryOf('/api/weather')).toEqual({ name: '', adm: '' });
+		expect(weatherQueryOf('/api/weather/a/b/c')).toBe(null);
+		expect(weatherQueryOf('/api/config/北京')).toBe(null);
+		expect(weatherQueryOf('/39/2023/1班')).toBe(null);
+		expect(weatherQueryOf('/')).toBe(null);
+	});
+
+	test('畸形或超长的城市名不接管', () => {
+		expect(weatherQueryOf('/api/weather/%E5')).toBe(null, '非法百分号序列要拒绝，不能抛异常');
+		expect(weatherQueryOf('/api/weather/' + 'x'.repeat(65))).toBe(null);
+		expect(weatherQueryOf('/api/weather/a%2Fb')).toBe(null, '解码出路径分隔符的要拒绝');
+		expect(weatherQueryOf('/api/weather/a%08b')).toBe(null, '控制字符要拒绝');
 	});
 });
 
-describe('KV 键', () => {
+describe('缓存键', () => {
 	test('键只用 ESA 允许的字符：字母、数字、-、_ 和 .', () => {
-		const key = entryKeyOf(HOST, '某某中学/2023级/1班');
-		expect(key.startsWith('s1.' + HOST + '.')).toBe(true);
+		const key = cacheKeyOf({ name: '某某中学', adm: '某某省' });
+		expect(key.startsWith('w1.')).toBe(true);
 		expect(/^[0-9A-Za-z._-]+$/.test(key)).toBe(true);
 		expect(key.length).toBeLessThanOrEqual(512);
 	});
 
-	test('base64url 与 UTF-8 编码正确（中文班级路径）', () => {
-		const input = '某某中学/2023级/1班';
-		const expected = Buffer.from(input, 'utf8')
+	test('base64url 与 UTF-8 编码正确', () => {
+		const expected = Buffer.from('北京', 'utf8')
 			.toString('base64')
 			.replace(/\+/g, '-')
 			.replace(/\//g, '_')
 			.replace(/=+$/, '');
-		expect(base64url(input)).toBe(expected);
-		expect(/^[0-9A-Za-z_-]+$/.test(base64url(input))).toBe(true);
+		expect(base64url('北京')).toBe(expected);
 	});
 
-	test('世代键按 host 隔离，且不做大小写折叠', () => {
-		expect(genKeyOf(HOST)).toBe('g1.' + HOST);
-		// 后端 ParseHostToNamespace 不做小写折叠，边缘不能自作主张把两者并成一个键
-		expect(genKeyOf('AAA.GetAstra.CN')).toBe('g1.AAA.GetAstra.CN');
+	test('键无歧义：城市与省份不会串位，有无省份也不同键', () => {
+		const a = cacheKeyOf({ name: 'A/B', adm: '' });
+		const b = cacheKeyOf({ name: 'A', adm: '/B' });
+		expect(a).not.toBe(b);
+		expect(cacheKeyOf({ name: '北京', adm: '' })).not.toBe(
+			cacheKeyOf({ name: '北京', adm: '北京市' }),
+		);
 	});
 });
 
 describe('读取路径', () => {
-	test('KV 未命中时回源，并把源站返回的元信息写入 KV', async () => {
-		const response = await edgeCache.fetch(getRequest());
+	test('未命中时边缘自己查和风天气，返回与源站同形的响应并写缓存', async () => {
+		const response = await call();
 
 		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
-		const stored = kv.data.get(entryKeyOf(HOST, '39/2023/1'));
-		expect(JSON.parse(stored)).toMatchObject({ v: VERSION, e: EXPIRE, g: '' });
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('miss');
+		expect(out.upstream).toHaveLength(3, '城市查询 + 实时天气 + 预警');
+		expect(out.origin).toHaveLength(0, '不该回源');
+		expect(await response.json()).toEqual({
+			where: '北京',
+			temp: '21',
+			weat: '晴',
+			wind: '东南风',
+			wind_power: '1',
+			warn: '高温预警',
+			brief_warn: '高温预警',
+		});
+
+		const stored = JSON.parse(kv.data.get(cacheKeyOf({ name: CITY, adm: '' })));
+		expect(typeof stored.b).toBe('string');
+		expect(stored.e).toBeGreaterThan(Math.floor(Date.now() / 1000));
 	});
 
-	test('命中且未过期时直接回 304，不再回源', async () => {
-		await edgeCache.fetch(getRequest());
-		origin.length = 0;
+	test('命中时不再查和风天气，也不回源', async () => {
+		await call();
+		out.upstream.length = 0;
+		out.origin.length = 0;
 
-		const response = await edgeCache.fetch(getRequest());
-
-		expect(response.status).toBe(304);
-		expect(response.headers.get('X-Astra-Edge-Cache')).toBe('hit');
-		expect(response.headers.get('X-Astra-Schedule-Version')).toBe(VERSION);
-		expect(origin).toHaveLength(0);
-	});
-
-	test('客户端版本不同则回源', async () => {
-		await edgeCache.fetch(getRequest());
-		origin.length = 0;
-
-		const response = await edgeCache.fetch(
-			getRequest('?version=' + encodeURIComponent('1:1:2')),
-		);
+		const response = await call();
 
 		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('hit');
+		expect(out.upstream).toHaveLength(0);
+		expect(out.origin).toHaveLength(0);
+		expect((await response.json()).temp).toBe('21');
 	});
 
-	test('条目已过期（越过 expire）则回源', async () => {
-		await edgeCache.fetch(
-			new Request('https://' + HOST + CLASS_PATH + '?version=' + VERSION),
-		);
+	test('条目过期后重新查和风天气', async () => {
+		await call();
 		kv.data.set(
-			entryKeyOf(HOST, '39/2023/1'),
-			JSON.stringify({ v: VERSION, e: past(), g: '' }),
+			cacheKeyOf({ name: CITY, adm: '' }),
+			JSON.stringify({ b: '{"temp":"旧"}', e: Math.floor(Date.now() / 1000) - 1 }),
 		);
-		origin.length = 0;
+		out.upstream.length = 0;
 
-		const response = await edgeCache.fetch(getRequest());
+		const response = await call();
 
-		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('miss');
+		expect(out.upstream).toHaveLength(3);
+		expect((await response.json()).temp).toBe('21');
 	});
 
-	test('源站返回 304 时用客户端版本刷新 KV 的过期时间', async () => {
-		const expireAt = future();
-		origin = installOrigin(
-			() =>
-				new Response(null, {
-					status: 304,
-					headers: { 'X-Astra-Schedule-Expire': String(expireAt) },
-				}),
-		);
+	test('KV 里的值格式不认识时按未命中处理', async () => {
+		kv.data.set(cacheKeyOf({ name: CITY, adm: '' }), 'not-json');
 
-		const response = await edgeCache.fetch(getRequest());
+		const response = await call();
 
-		expect(response.status).toBe(304);
-		const stored = JSON.parse(kv.data.get(entryKeyOf(HOST, '39/2023/1')));
-		expect(stored.v).toBe(VERSION);
-		expect(stored.e).toBe(expireAt);
-
-		origin.length = 0;
-		expect((await edgeCache.fetch(getRequest())).status).toBe(304);
-		expect(origin).toHaveLength(0);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('miss');
+		expect(out.upstream).toHaveLength(3);
 	});
 
-	test('源站没给元信息头时不缓存，下次仍然回源', async () => {
-		origin = installOrigin(
-			() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }),
-		);
+	test('省份参与查询：带上 adm 参数，并落进独立的缓存键', async () => {
+		await call(request(weatherPathWithAdm));
 
-		expect((await edgeCache.fetch(getRequest())).status).toBe(200);
-		expect(kv.data.size).toBe(0);
-
-		origin.length = 0;
-		expect((await edgeCache.fetch(getRequest())).status).toBe(200);
-		expect(origin).toHaveLength(1);
-	});
-
-	test('源站 5xx 不写入 KV', async () => {
-		origin = installOrigin(
-			() =>
-				new Response('boom', {
-					status: 500,
-					headers: { 'X-Astra-Schedule-Expire': String(future()) },
-				}),
-		);
-
-		expect((await edgeCache.fetch(getRequest())).status).toBe(500);
-		expect(kv.data.size).toBe(0);
+		const lookup = out.upstream.find((u) => u.url.includes('/geo/v2/city/lookup'));
+		expect(decodeURIComponent(lookup.url)).toContain('location=北京&adm=北京市');
+		expect(kv.data.has(cacheKeyOf({ name: CITY, adm: ADM }))).toBe(true);
+		expect(kv.data.has(cacheKeyOf({ name: CITY, adm: '' }))).toBe(false);
 	});
 });
 
-describe('写入路径与失效', () => {
-	test('写请求成功后推进世代，使同域名下所有班级的缓存失效', async () => {
-		await edgeCache.fetch(getRequest());
-		expect(kv.data.has(genKeyOf(HOST))).toBe(false);
+// 不带城市的老路径原来靠 Cloudflare 的 CF-IPCity 头；站点迁到 ESA 之后改用运行时的
+// request.info（实测字段：ip_city_en / ip_region_en / ip_city_id / remote_addr ...）。
+describe('不带城市：用 request.info 定位客户端所在城市', () => {
+	const INFO = {
+		ip_city_en: 'Nanjing',
+		ip_region_en: 'Jiangsu',
+		ip_region_id: 'CN-JS',
+		ip_city_id: '320100',
+		remote_addr: '180.111.34.224',
+	};
 
-		origin = installOrigin(() => new Response('ok', { status: 200 }));
-		const put = await edgeCache.fetch(
-			new Request('https://' + HOST + '/web/config/2023/1/1/schedule', {
-				method: 'PUT',
-				body: '{}',
-			}),
-		);
-		expect(put.status).toBe(200);
-		expect(kv.data.has(genKeyOf(HOST))).toBe(true);
+	test('有 request.info 时在边缘查天气，并按定位到的城市写缓存', async () => {
+		const response = await edgeWeather.fetch(request('/api/weather/', {}, INFO), {}, ENV);
 
-		// 版本号没变，但世代变了：必须回源
-		origin = installOrigin(() => scheduleResponse());
-		const after = await edgeCache.fetch(getRequest());
-		expect(after.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		expect(response.status).toBe(200);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('miss');
+		expect(out.origin).toHaveLength(0, '不该回源');
+		const lookup = out.upstream.find((u) => u.url.includes('/geo/v2/city/lookup'));
+		expect(lookup.url).toContain('location=Nanjing');
+		expect(lookup.url).not.toContain('adm=', '只传城市名，省名对不上和风天气词表时反而多一种失败模式');
+		expect(kv.data.has(cacheKeyOf({ name: 'Nanjing', adm: '' }))).toBe(true);
 	});
 
-	test('写请求失败（4xx）不推进世代，缓存继续有效', async () => {
-		await edgeCache.fetch(getRequest());
+	test('定位结果同样吃缓存', async () => {
+		await edgeWeather.fetch(request('/api/weather/', {}, INFO), {}, ENV);
+		out.upstream.length = 0;
 
-		origin = installOrigin(() => new Response('bad request', { status: 400 }));
-		await edgeCache.fetch(
-			new Request('https://' + HOST + '/web/config/2023/1/1/schedule', {
-				method: 'PUT',
-				body: '{}',
-			}),
-		);
+		const response = await edgeWeather.fetch(request('/api/weather/', {}, INFO), {}, ENV);
 
-		expect(kv.data.has(genKeyOf(HOST))).toBe(false);
-		origin = installOrigin(() => scheduleResponse());
-		expect((await edgeCache.fetch(getRequest())).status).toBe(304);
-		expect(origin).toHaveLength(0);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('hit');
+		expect(out.upstream).toHaveLength(0);
 	});
 
-	test('客户端 PUT 班级课表同样推进世代', async () => {
-		await edgeCache.fetch(getRequest());
-		origin = installOrigin(() => new Response('ok', { status: 200 }));
+	test('没有 request.info 时回源，不自造响应', async () => {
+		const response = await call(request('/api/weather/'));
 
-		await edgeCache.fetch(
-			new Request('https://' + HOST + CLASS_PATH, { method: 'PUT', body: '{}' }),
+		expect(await response.text()).toBe('origin');
+		expect(out.origin).toHaveLength(1);
+		expect(out.upstream).toHaveLength(0);
+	});
+
+	test('info 里只有国家、没有城市时回源', async () => {
+		const response = await edgeWeather.fetch(
+			request('/api/weather/', {}, { ip_country_id: 'CN', ip_country_en: 'China' }),
+			{},
+			ENV,
 		);
 
-		expect(kv.data.has(genKeyOf(HOST))).toBe(true);
+		expect(await response.text()).toBe('origin');
+		expect(out.upstream).toHaveLength(0);
+	});
+
+	test('城市名非法时不用它', () => {
+		expect(geoQueryOf({ info: { ip_city_en: 'Nanjing' } })).toEqual({
+			name: 'Nanjing',
+			adm: '',
+		});
+		expect(geoQueryOf({ info: { ip_city_en: 'a/b' } })).toBe(null);
+		expect(geoQueryOf({ info: { ip_city_en: 'x'.repeat(65) } })).toBe(null);
+		expect(geoQueryOf({ info: { ip_city_en: '   ' } })).toBe(null);
+		expect(geoQueryOf({ info: {} })).toBe(null);
+		expect(geoQueryOf({ info: 'not-an-object' })).toBe(null);
+		expect(geoQueryOf({})).toBe(null);
+		expect(geoQueryOf(undefined)).toBe(null);
 	});
 });
 
 describe('降级与旁路', () => {
-	test('请求带 Origin（浏览器跨域）时不走 304 快路径', async () => {
-		await edgeCache.fetch(getRequest());
-		origin.length = 0;
+	test('没配函数变量时不接管，直接回源', async () => {
+		kv = installKv();
+		installFetch(defaultQweather);
 
-		const response = await edgeCache.fetch(
-			getRequest(undefined, { headers: { Origin: 'https://njx.getastra.cn' } }),
-		);
+		const response = await call(request(weatherPath), {});
+
+		expect(await response.text()).toBe('origin');
+		expect(out.upstream).toHaveLength(0);
+		expect(out.origin).toHaveLength(1);
+		expect(kv.data.size).toBe(0);
+	});
+
+	test('和风天气城市查询失败时回源', async () => {
+		installFetch(() => jsonResponse({ code: '404' }));
+
+		const response = await call();
+
+		expect(await response.text()).toBe('origin');
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('和风天气实时天气失败（temp 为空）时回源', async () => {
+		installFetch((url) => {
+			if (url.includes('/geo/v2/city/lookup')) return jsonResponse(LOCATION_BODY);
+			if (url.includes('/v7/weather/now')) return jsonResponse({ code: '200', now: {} });
+			return jsonResponse(ALERT_BODY);
+		});
+
+		expect(await (await call()).text()).toBe('origin');
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('和风天气返回非 200 或非 JSON 时回源', async () => {
+		installFetch(() => new Response('boom', { status: 502 }));
+		expect(await (await call()).text()).toBe('origin');
+		expect(out.origin).toHaveLength(1);
+
+		installFetch(() => new Response('not json', { status: 200 }));
+		expect(await (await call()).text()).toBe('origin');
+	});
+
+	test('预警接口失败不影响天气返回', async () => {
+		installFetch((url) => {
+			if (url.includes('/geo/v2/city/lookup')) return jsonResponse(LOCATION_BODY);
+			if (url.includes('/v7/weather/now')) return jsonResponse(NOW_BODY);
+			return new Response('nope', { status: 500 });
+		});
+
+		const response = await call();
 
 		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		const body = await response.json();
+		expect(body.temp).toBe('21');
+		expect(body.warn).toBe('');
+		expect(body.brief_warn).toBe('');
 	});
 
-	test('班级 GET 之外的路径一律透传', async () => {
-		const paths = ['/', '/39/2023', '/api/weather/beijing', '/web/config/2023/1/1/schedule'];
-		for (const path of paths) {
-			origin.length = 0;
-			await edgeCache.fetch(new Request('https://' + HOST + path));
-			expect(origin).toHaveLength(1);
-		}
-		expect(kv.data.size).toBe(0);
-	});
-
-	test('没有 version 参数时透传', async () => {
-		await edgeCache.fetch(new Request('https://' + HOST + CLASS_PATH));
-		expect(origin).toHaveLength(1);
-		expect(kv.data.size).toBe(0);
-	});
-
-	test('KV 读写抛异常时降级为回源，不影响响应', async () => {
+	test('KV 读写抛异常时仍然返回天气', async () => {
 		kv = installKv({ failGet: true, failPut: true });
-		const response = await edgeCache.fetch(getRequest());
+
+		const response = await call();
+
 		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		expect((await response.json()).temp).toBe('21');
 	});
 
-	test('运行时没有 EdgeKV 全局时降级为回源', async () => {
+	test('运行时没有 EdgeKV 全局时不缓存，但天气照常返回', async () => {
 		delete globalThis.EdgeKV;
-		const response = await edgeCache.fetch(getRequest());
+
+		const response = await call();
+
 		expect(response.status).toBe(200);
-		expect(origin).toHaveLength(1);
+		expect((await response.json()).temp).toBe('21');
 	});
 
 	test('KV 绑定到正确的存储空间', async () => {
-		await edgeCache.fetch(getRequest());
+		await call();
 		expect(kv.namespaces.every((n) => n === 'astra')).toBe(true);
 	});
-});
 
-describe('元信息解析', () => {
-	test('parseExpire 只接受正整数秒', () => {
-		expect(parseExpire('1758384000')).toBe(1758384000);
-		expect(parseExpire('0')).toBe(0);
-		expect(parseExpire('-1')).toBe(0);
-		expect(parseExpire('abc')).toBe(0);
-		expect(parseExpire('')).toBe(0);
-		expect(parseExpire(null)).toBe(0);
-		expect(parseExpire(undefined)).toBe(0);
-	});
+	test('非天气路径与非 GET 方法一律透传', async () => {
+		const paths = ['/', '/39/2023/1', '/api/weather/a/b/c', '/api/weather/a/b/c/d', '/web/config/2023'];
+		for (const path of paths) {
+			out.origin.length = 0;
+			await edgeWeather.fetch(request(path), {}, ENV);
+			expect(out.origin).toHaveLength(1);
+		}
+		out.origin.length = 0;
+		await edgeWeather.fetch(request(weatherPath, { method: 'POST', body: '{}' }), {}, ENV);
+		expect(out.origin).toHaveLength(1);
 
-	test('源站版本串格式非法或缺少 expire 时 readMeta 返回 null', () => {
-		const bad = (version, expire) =>
-			new Response('{}', {
-				status: 200,
-				headers: {
-					...(version === null ? {} : { 'X-Astra-Schedule-Version': version }),
-					...(expire === null ? {} : { 'X-Astra-Schedule-Expire': expire }),
-				},
-			});
-
-		expect(readMeta(bad(VERSION, '1758384000'), VERSION)).toEqual({
-			v: VERSION,
-			e: 1758384000,
-		});
-		// 版本串必须是纯 ASCII 且符合约定字符集（HTTP 头本身也不能承载非 ASCII 值）
-		expect(readMeta(bad('bad version!', '1758384000'), VERSION)).toBe(null);
-		expect(readMeta(bad('v/1', '1758384000'), VERSION)).toBe(null);
-		expect(readMeta(bad('x'.repeat(129), '1758384000'), VERSION)).toBe(null);
-		expect(readMeta(bad('', '1758384000'), VERSION)).toBe(null);
-		expect(readMeta(bad(VERSION, null), VERSION)).toBe(null);
-		expect(readMeta(bad(VERSION, 'abc'), VERSION)).toBe(null);
-		expect(readMeta(new Response('{}', { status: 500 }), VERSION)).toBe(null);
-	});
-});
-
-// 自审中发现的两个缺陷的回归用例：
-// 1) 用「非 HEAD 就失效」会让跨域预检 OPTIONS 打掉整个域名的缓存；
-// 2) 用 url.host 而非 url.hostname 会把非默认端口的冒号带进 KV 键。
-describe('回归：只读方法与键字符集', () => {
-	test('跨域预检 OPTIONS 返回 2xx 不推进世代，缓存继续有效', async () => {
-		await edgeCache.fetch(getRequest());
-
-		origin = installOrigin(() => new Response(null, { status: 204 }));
-		await edgeCache.fetch(
-			new Request('https://' + HOST + CLASS_PATH, { method: 'OPTIONS' }),
-		);
-
-		expect(kv.data.has(genKeyOf(HOST))).toBe(false);
-		origin = installOrigin(() => scheduleResponse());
-		expect((await edgeCache.fetch(getRequest())).status).toBe(304);
-		expect(origin).toHaveLength(0);
-	});
-
-	test('HEAD 请求不推进世代', async () => {
-		await edgeCache.fetch(getRequest());
-
-		origin = installOrigin(() => new Response(null, { status: 200 }));
-		await edgeCache.fetch(new Request('https://' + HOST + CLASS_PATH, { method: 'HEAD' }));
-
-		expect(kv.data.has(genKeyOf(HOST))).toBe(false);
-		origin = installOrigin(() => scheduleResponse());
-		expect((await edgeCache.fetch(getRequest())).status).toBe(304);
-		expect(origin).toHaveLength(0);
-	});
-
-	test('请求带非默认端口时键里不含冒号', async () => {
-		await edgeCache.fetch(
-			new Request('https://' + HOST + ':8443' + CLASS_PATH + '?version=' + VERSION),
-		);
-
-		const keys = [...kv.data.keys()];
-		expect(keys).toHaveLength(1);
-		expect(keys[0]).not.toContain(':');
-		expect(keys[0]).toBe(entryKeyOf(HOST, '39/2023/1'));
-	});
-
-	test('源站给出的过期时刻已经过去时不写入 KV', async () => {
-		origin = installOrigin(() => scheduleResponse(VERSION, past()));
-
-		const response = await edgeCache.fetch(getRequest());
-
-		expect(response.status).toBe(200);
+		expect(out.upstream).toHaveLength(0);
 		expect(kv.data.size).toBe(0);
 	});
+
+	test('函数内部抛异常时回源，不把异常抛给客户端', async () => {
+		installFetch(() => {
+			throw new Error('upstream exploded');
+		});
+
+		const response = await call();
+
+		expect(await response.text()).toBe('origin');
+		expect(out.origin).toHaveLength(1);
+	});
 });
 
-// 后端的 namespace 完全由 **Host 头**推导（usr-backend middleware.ParseHostToNamespace：
-// 先剥端口、再把域名标签反转成 cn/getastra/class，且不做大小写折叠）。
-// 边缘缓存的键必须与这个输入逐字对齐——对齐错了就是把 A 租户的版本当成 B 租户的。
-describe('namespace 隔离（键必须与后端 Host 推导对齐）', () => {
-	// 用最小桩直接喂 Host 头：Request 的 host 头在部分运行时不可设置
-	const withHost = (host) => ({
-		headers: { get: (name) => (String(name).toLowerCase() === 'host' ? host : null) },
+describe('上游请求', () => {
+	test('中文城市名进入上游 URL 前被编码，且带上 API Key 头', async () => {
+		await call();
+
+		const lookup = out.upstream[0];
+		expect(lookup.url).not.toContain('北京');
+		expect(lookup.url).toContain(encodeURIComponent('北京'));
+		expect(lookup.headers.get('X-QW-Api-Key')).toBe(QW_KEY);
 	});
 
-	test('hostOf 剥端口、保留大小写、拒绝非法值', () => {
-		expect(hostOf(withHost('class.getastra.cn'), 'x')).toBe('class.getastra.cn');
-		expect(hostOf(withHost('CLASS.getastra.cn'), 'x')).toBe('CLASS.getastra.cn');
-		expect(hostOf(withHost('class.getastra.cn:8443'), 'x')).toBe('class.getastra.cn');
-		expect(hostOf(withHost('  class.getastra.cn  '), 'x')).toBe('class.getastra.cn');
-		expect(hostOf(withHost('bad host'), 'x')).toBe(null);
-		expect(hostOf(withHost('evil/x'), 'x')).toBe(null);
-		expect(hostOf(withHost('[::1]:443'), 'x')).toBe(null);
-		expect(hostOf(withHost(''), 'fallback.getastra.cn')).toBe('fallback.getastra.cn');
-		expect(hostOf(withHost(null), '')).toBe(null);
+	test('预警用 5 位小数的经纬度，与源站一致', async () => {
+		await call();
+
+		const alert = out.upstream.find((u) => u.url.includes('/weatheralert/'));
+		expect(alert.url.endsWith('/39.90499/116.40529')).toBe(true);
 	});
 
-	test('键的推导必须无歧义：不同 Host 绝不能落到同一个键', () => {
-		// 这条用例咬的是「有损清洗」这个缺陷：旧实现是
-		//   host.toLowerCase().replace(/[^a-z0-9.-]/g, '')
-		// 而清洗是有损的——CLASS.getastra.cn 与 class.getastra.cn 会撞成一个键，
-		// cl\@ass.getastra.cn 会被清洗成 class.getastra.cn 落进别人的缓存。
-		// 这三者在后端是三个不同的 namespace，边缘必须给三个不同的键、或者干脆不缓存。
-		const keyOf = (host) => {
-			const h = hostOf(withHost(host), '');
-			return h === null ? null : entryKeyOf(h, '39/2023/1');
-		};
+	test('环境变量主机名非法时完全不发起上游请求，直接回源', async () => {
+		const response = await call(request(weatherPath), {
+			QW_API_HOST: 'evil.example.com/x?',
+			QW_API_KEY: QW_KEY,
+		});
 
-		expect(keyOf('cl@ass.getastra.cn')).toBe(null, '非法主机名必须被拒，而不是清洗后落进别人的键');
-		expect(keyOf('bad host')).toBe(null);
+		expect(await response.text()).toBe('origin');
+		expect(out.upstream).toHaveLength(0);
+	});
+});
 
-		const keys = ['class.getastra.cn', 'CLASS.getastra.cn', 'njx.getastra.cn'].map(keyOf);
-		expect(keys.filter((k) => k !== null)).toHaveLength(3);
-		expect(new Set(keys).size).toBe(3, '三个不同 namespace 必须是三个不同的键');
+describe('配置读取', () => {
+	test('env 缺失时回退到 context，两个都没有则视为未配置', () => {
+		expect(readConfig(ENV, {})).toEqual({ host: QW_HOST, key: QW_KEY });
+		expect(readConfig({}, { QW_API_HOST: QW_HOST, QW_API_KEY: QW_KEY })).toEqual({
+			host: QW_HOST,
+			key: QW_KEY,
+		});
+		expect(readConfig({}, {})).toBe(null);
+		expect(readConfig(undefined, undefined)).toBe(null);
+		expect(readConfig({ QW_API_HOST: QW_HOST }, {})).toBe(null, '缺 API Key 不接管');
+		expect(readConfig({ QW_API_KEY: QW_KEY }, {})).toBe(null, '缺主机名不接管');
+	});
+});
+
+describe('响应体组装', () => {
+	test('多条预警用中文分号拼接，描述里的换行被去掉（与源站一致）', () => {
+		const body = JSON.parse(
+			buildWeatherBody(
+				{ name: '北京' },
+				{ temp: '1', text: '晴', windDir: '风', windScale: '2' },
+				[
+					{ description: 'a\nb', headline: 'A' },
+					{ description: 'c', headline: 'B' },
+				],
+			),
+		);
+		expect(body.warn).toBe('ab；c');
+		expect(body.brief_warn).toBe('A；B');
 	});
 
-	test('不同 host 的同名班级不共用缓存条目', async () => {
-		await edgeCache.fetch(
-			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
+	test('预警数组里混入非对象项时跳过，不炸', () => {
+		const body = JSON.parse(
+			buildWeatherBody({ name: 'x' }, { temp: '1', text: '', windDir: '', windScale: '' }, [
+				null,
+				'junk',
+				{ description: 'ok', headline: 'OK' },
+			]),
 		);
-		origin.length = 0;
-
-		const other = await edgeCache.fetch(
-			new Request('https://njx.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
-		);
-
-		expect(other.status).toBe(200, '另一个租户不该命中 class 的缓存');
-		expect(origin).toHaveLength(1);
-		expect(kv.data.has(entryKeyOf('class.getastra.cn', '39/2023/1'))).toBe(true);
-		expect(kv.data.has(entryKeyOf('njx.getastra.cn', '39/2023/1'))).toBe(true);
-	});
-
-	test('写请求只推进自己那个 host 的世代', async () => {
-		await edgeCache.fetch(
-			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
-		);
-
-		origin = installOrigin(() => new Response('ok', { status: 200 }));
-		await edgeCache.fetch(
-			new Request('https://njx.getastra.cn/web/config/2023/1/1/schedule', {
-				method: 'PUT',
-				body: '{}',
-			}),
-		);
-
-		expect(kv.data.has(genKeyOf('njx.getastra.cn'))).toBe(true);
-		expect(kv.data.has(genKeyOf('class.getastra.cn'))).toBe(false, '不该波及别的租户');
-
-		origin = installOrigin(() => scheduleResponse());
-		const after = await edgeCache.fetch(
-			new Request('https://class.getastra.cn' + CLASS_PATH + '?version=' + VERSION),
-		);
-		expect(after.status).toBe(304);
-		expect(origin).toHaveLength(0);
+		expect(body.warn).toBe('ok');
 	});
 });

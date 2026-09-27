@@ -1,35 +1,8 @@
 # 部署步骤
 
-> **本次没有执行任何部署。** 下面第 0 节先纠正一个本仓库早期版本搞错的前提。
+> 本文件记录的是**实际执行过**的步骤（2026-09-26 上线）。所有命令都在仓库根目录执行。
 
-## 0. 前提纠正：ESA 这边要建的是 **Pages**，不是独立的「边缘函数」
-
-ESA 控制台「边缘计算和 AI > 函数和Pages > 创建 > **导入 Github 仓库**」这条路径，
-产出的就是 **Pages**——官方文档标题即《通过导入 Github 仓库创建 Pages》。
-
-这个账号里现有的 5 个（`usr-dashboard` / `sys-dashboard` / `reg-go` / `docs-site` /
-`khbitcn-astro`）全都是这么来的：在 OpenAPI 里它们表现为 `Routine`，且 `HasAssets: true`
-（实测 `ListUserRoutines`、`ListRoutineBuildConfigurations`）。
-
-**Pages 可以同时承载静态资源和一段边缘函数**，两者是构建信息里的两个独立字段：
-
-| 字段 | esa.jsonc | 含义 |
-|---|---|---|
-| 静态资源目录 | `assets.directory` | 构建产物中被静态托管的目录 |
-| 函数文件路径 | `entry` | 边缘函数的入口文件 |
-
-路由顺序是：请求到达 → 命中静态资源就直接响应 → **没命中就执行函数脚本** → 都没有才 404。
-所以一个**不配置静态资源**的 Pages，等价于一个纯函数。
-
-本仓库就是这个用法：`esa.jsonc` 只给 `entry`，不给 `assets`。
-
-> 本仓库早期版本没有 `esa.jsonc`，ESA 只能靠猜，于是被识别成了静态站点 Pages。
-> 这是那个版本的缺陷，现已补上。
-
-## 1. esa.jsonc：让 ESA 不用猜
-
-仓库根目录的 `esa.jsonc` 会被自动识别，并且**作为配置的唯一来源**——一旦存在，
-控制台里对应的配置项全部不生效（官方明确的优先级）。所以它是本仓库部署时的唯一真相。
+## 1. 项目配置：esa.jsonc
 
 ```json
 {
@@ -42,125 +15,150 @@ ESA 控制台「边缘计算和 AI > 函数和Pages > 创建 > **导入 Github �
 
 | 字段 | 值 | 原因 |
 |---|---|---|
-| `name` | `esa-edge-cache` | 部署目标项目名；不存在时 ESA 用这个名字自动创建 |
-| `entry` | `./src/index.js` | 边缘函数入口。本仓库不需要构建，直接执行源码 |
-| `installCommand` | `""` | 无依赖。文档明确「设置成空字符串，安装步骤将被跳过」 |
-| `buildCommand` | `""` | 无构建产物，同上 |
-| `assets` | **刻意不写** | 不托管静态资源，所有请求都落到函数脚本；写了 `assets.directory` 反而会让静态资源优先于函数 |
+| `name` | `esa-edge-cache` | 部署目标项目名；不存在时 `esa-cli` 自动创建（本次就是新建的） |
+| `entry` | `./src/index.js` | 边缘函数入口，不需要构建 |
+| `installCommand` / `buildCommand` | `""` | 无依赖、无构建产物，空字符串表示跳过该步骤 |
+| `assets` | **刻意不写** | 不托管静态资源，请求全部落到函数 |
 
-文件用严格 JSON（不带注释），避免依赖 ESA 对 JSONC 的容错。说明都放在这份文档里。
-
-## 2. 创建 Pages
-
-控制台：**边缘计算和 AI > 函数和Pages > 创建 > 导入 Github 仓库**，
-选择 `AstraSchedule/esa-edge-cache`，分支 `main`。
-
-仓库里有 `esa.jsonc`，构建信息会以它为准，界面上不需要额外填写。
-
-## 3. 挂到后端域名：用「路由」，**不要**用「域名绑定」
-
-这一条是本方案最容易做错的地方。
-
-后端域名（`class.` / `njx.` / `kuohu.` / `sandbox.` …）现在的 DNS 记录指向
-**源站组** `astrasaas.origin-pool.getastra.cn`，也就是 FC 函数 `AstraSaaS-Go`。
-
-- **域名绑定**：把整个域名的全部请求交给 Pages。绑定之后这个域名就不再回原来那个源站了，
-  **FC 被绕开，接口直接废掉**。不要对后端域名做域名绑定。
-- **函数路由**：只有匹配的请求进入函数，其余继续走加速回源；函数内部 `fetch(request)`
-  把请求转发给**该域名原本的源站**。这正是我们要的：命中版本缓存就直接回 304，
-  没命中就原样透传给 FC，源站仍然是 FC。
-
-操作位置：该 Pages 详情页 → **域名** → 路由 → 添加路由；或使用 OpenAPI `CreateRoutineRoute`。
-
-### 覆盖范围
-
-`getastra.cn` 下**除** `i.` / `sys.` / `dev.` / `go.` / `to.` / 裸域 / `www.`
-**之外**的全部子域。
-
-原因是 namespace 由 Host 推导（usr-backend 的 `middleware.ParseHostToNamespace`：
-`aaa-do.getastra.cn` → `cn/getastra/aaa-do`），所以租户子域同样直接提供客户端课表接口；
-被排除的那几个是前端/文档/Pages 站点，不提供课表接口。
-
-> **不要图省事写 `*.getastra.cn/*`**。被排除的域名已经绑定了别的 Pages
-> （`usr-dashboard` / `sys-dashboard` / `reg-go` / `docs-site` / `khbitcn-astro`，
-> 外加 `i.getastra.cn` 上那个 Pages 站点），路由把它们吞掉会把前端直接劫持。
-
-边缘函数按 **hostname** 分组缓存（键 `s1.<host>.<base64url(班级路径)>`），
-多租户天然隔离，不需要为每个子域单独配置。
-
-### 两个我无法离线确认的点
-
-1. **路由规则要求主机名在站点下存在 DNS 记录。** 官方文档写明：简单模式填带前缀的域名时，
-   ESA 的 DNS 记录里必须有一条对应记录，否则访问会失败。
-   但我实测 `ListRecords` 只返回 11 条，而 `i.getastra.cn` 明明解析正常却**不在其中**——
-   说明 **Pages 的域名绑定会自己建 DNS 记录，且不出现在 `ListRecords` 里**。
-   所以配路由时以**控制台里能选到的域名**为准，不要只信 `ListRecords` 的输出。
-2. **函数路由下 `fetch(request)` 是否确实回源到该域名原有的源站。** 官方《基于 ESA 边缘函数的
-   转发和重定向实践指南》用的是 `fetch(new Request(newUrl, request))` 转发到指定源站，
-   说明回源是函数内的显式能力；但「路由命中的同域请求原样 `fetch` 会回到该域名的源站、
-   而不是再次进入函数自身」这一点，我没有在真实环境验证过。
-   **第一次上线必须先用一个非生产域名试，并观察 FC 的调用数是否正常增长。**
-
-## 4. 验证
+## 2. 部署
 
 ```bash
-# 第一次：缓存未命中，应回源并返回 200
-curl -sS -D - -o /dev/null "https://class.getastra.cn/<school>/<grade>/<class>?version=0"
-
-# 第二次：带上第一次响应头里的 X-Astra-Schedule-Version，应直接返回 304，
-# 且带有 X-Astra-Edge-Cache: hit（说明是边缘回的，没有回源）
-curl -sS -D - -o /dev/null \
-  "https://class.getastra.cn/<school>/<grade>/<class>?version=<上一步的版本串>"
+cd esa-edge-cache
+aliyun esa-cli deploy --environment production
 ```
 
-同时到 Pages 的监控里看**请求数**与**子请求数**：命中时子请求数不增长，说明没有回源。
+首次执行会依次：检查登录态 → 创建 Routine → 上传 `src/index.js` → 生成代码版本 →
+发布到生产环境。输出里会带一个**有效期 1 小时**的预览地址：
 
-## 5. 回滚
+```
+https://esa-edge-cache-1616808033455959.debug.er.aliyun-esa.net?esa_er_token=<token>
+```
 
-把那条路由停掉或删掉即可，行为立刻回到「每次请求都回源」：
+> 预览地址必须带 `esa_er_token`，否则 401。该 token 只在部署输出里出现，
+> 想复用它做验证就在**同一条命令**里捕获，别手抄。
+
+## 3. 函数变量（和风天气凭据）
+
+变量按环境存储，且**改完必须重新部署一次**，新版本才会绑定新的变量快照。
+
+```bash
+# 主机名：明文变量
+aliyun esa-cli env set "QW_API_HOST=<apihost>" --environment production -n esa-edge-cache
+
+# API Key：加密 secret，从 stdin 读，避免落进命令历史
+Get-Content <path-to-config.toml> -Raw | ... | aliyun esa-cli secret put QW_API_KEY --environment production -n esa-edge-cache --stdin
+
+# 让新版本绑定这次的变量快照
+aliyun esa-cli deploy --environment production
+
+# 确认
+aliyun esa-cli env list --environment production -n esa-edge-cache
+```
+
+两个坑，都踩过：
+
+1. **用长参数 `--environment`，不要用 `-e`**。`-e` 会被 `aliyun` 主 CLI 自己吃掉，
+   `esa-cli` 收到的是缺参数的调用，直接报 `Missing required argument: environment`。
+2. 命令的工作目录会影响相对路径，读 `config.toml` 这类仓库外文件时给绝对路径。
+
+变量名只能字母、数字、下划线。读不到变量时函数**静默回源**，表现为「部署成功但天气没走边缘」，
+排查时先看这里。
+
+## 4. 挂函数路由：用「路由」，**不要**用「域名绑定」
+
+这是最容易做错的地方。
+
+- **域名绑定**：把整个域名的全部请求交给函数。绑定之后这个域名就不再回原来那个源站了，
+  **FC 被绕开，接口直接废掉**。不要对后端域名做域名绑定。
+- **函数路由**：只有匹配的请求进入函数，其余继续走加速回源；函数内部 `fetch(request)`
+  把请求转发给**该域名原本的源站**。
+
+本函数只接管一个路径前缀，所以路由也按路径收窄。线上最终用的是**一条**自定义规则
+（先按域名逐条建、拿到简单模式生成的写法后再合并成一条，避免每加一个租户域名就要动配置）：
+
+```
+(not http.host in {"getastra.cn" "sys.getastra.cn" "to.getastra.cn" "i.getastra.cn" "www.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and starts_with(http.request.uri, "/api/weather/"))
+```
+
+```bash
+# 新建（单条）
+aliyun esa CreateRoutineRoute --region cn-hangzhou --SiteId 178107369359596 \
+  --RoutineName esa-edge-cache --RouteName edge-weather --RouteEnable on --Fallback on \
+  --Rule '(not http.host in {"getastra.cn" "sys.getastra.cn" "to.getastra.cn" "i.getastra.cn" "www.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and starts_with(http.request.uri, "/api/weather/"))'
+
+# 查看线上真实配置
+aliyun esa ListRoutineRoutes --region cn-hangzhou --RoutineName esa-edge-cache
+```
+
+当前只有一条路由：ConfigId `521112930863104`（RouteName `edge-weather-class`，
+Mode `custom`，Fallback `on`）。
+
+### 覆盖范围与排除项
+
+规则是「**除黑名单外的全部子域** + `/api/weather/` 前缀」，所以新增租户域名不用改配置。
+黑名单里的域名各有原因：
+
+| 域名 | `/api/weather/北京` | 为什么排除 |
+|---|---|---|
+| `class` / `njx` / `kuohu` / `sandbox.getastra.cn` | 200 | 后端租户域名，走边缘天气 |
+| `sys.getastra.cn` | 404 | sys-dashboard 前端 |
+| `to.getastra.cn` | 404 | reg-to 前端 |
+| `i.` / `dev.` / `go.` / `www.` / 裸域 | — | 已绑定别的 Pages，吞进函数会把前端劫持 |
+
+**不要图省事去掉黑名单写 `*.getastra.cn/*`**：被排除的域名已经绑定了别的 Pages，
+把整个域名吞进函数会把前端一起劫持。
+
+## 5. 验证
+
+```bash
+# 1) 挂路由前先打预览地址，确认函数本身能出天气（miss 表示边缘现查的上游）
+curl -sS -D - "https://<预览域名>/api/weather/%E5%8C%97%E4%BA%AC?esa_er_token=<token>"
+
+# 2) 挂路由后打线上域名，响应该带 X-Astra-Edge-Weather: hit
+curl -sS -D - "https://class.getastra.cn/api/weather/%E5%8C%97%E4%BA%AC"
+
+# 3) 同一个域名上别的路径不受影响（不应带 X-Astra-Edge-Weather）
+curl -sS -D - "https://class.getastra.cn/39/2023/1" -o /dev/null
+
+# 4) 不带城市的 /api/weather/：边缘按客户端 IP 定位（ESA request.info 的 ip_city_en），
+#    应返回 200 + X-Astra-Edge-Weather，而不是迁移后源站那个 400
+curl -sS -D - "https://class.getastra.cn/api/weather/"
+
+# 5) KV 里确实有缓存条目
+aliyun esa ListKvs --region cn-hangzhou --Namespace astra --Prefix w1.
+```
+
+上线当天实测结果：
+
+| 请求 | 结果 |
+|---|---|
+| 4 个租户域名 `/api/weather/北京` | `200` + `X-Astra-Edge-Weather: hit` |
+| `class.getastra.cn/39/2023/1` | 源站响应，无边缘头（未受影响） |
+| `class.getastra.cn/api/weather/` | `200` + `edge=hit`，`{"where":"南京",...}`（按客户端 IP 定位） |
+| `sys.getastra.cn/api/weather/` | `404`（规则排除，行为未变） |
+| KV | 出现 `w1.5YyX5Lqs.`（北京）、`w1.TmFuamluZw.`（Nanjing）等键 |
+
+## 6. 回滚
+
+把路由停掉（或删掉）即刻回到「每次请求都回源」，不需要动函数本身：
 
 ```bash
 aliyun esa UpdateRoutineRoute --region cn-hangzhou \
-  --SiteId 178107369359596 --ConfigId <路由的 ConfigId> --RouteEnable off
+  --SiteId 178107369359596 --ConfigId <ConfigId> --RouteEnable off
 
 # 或彻底删除
 aliyun esa DeleteRoutineRoute --region cn-hangzhou \
-  --SiteId 178107369359596 --ConfigId <路由的 ConfigId>
+  --SiteId 178107369359596 --ConfigId <ConfigId>
 ```
 
-`ConfigId` 从 `ListRoutineRoutes` 或控制台取。
+只回滚代码则用 `aliyun esa-cli deployments list` 找到上一个版本，或直接
+`aliyun esa-cli deploy` 重新发布一次当前分支。
 
-## 6. 与 usr-backend 的部署顺序
+## 7. 排障提示
 
-边缘函数依赖源站下发的 `X-Astra-Schedule-Version` / `X-Astra-Schedule-Expire` 响应头
-（`usr-backend` 的 `router/client/getSchedule.go`）。
-
-**先发布 usr-backend，再挂路由。** 顺序反了也不会出错：源站没给头时边缘函数一律不写 KV、
-直接透传，只是缓存不生效而已。
-
-## 附录：不经 GitHub 的备选路径（未验证）
-
-如果想绕开 Pages 的 Git 工作流，也可以用 OpenAPI 直接建 Routine 并上传代码。
-账号里目前**没有这种先例**（现有 5 个全是 Git 构建），下面这条路径没有跑通过：
-
-```bash
-# a. 创建 Routine
-aliyun esa CreateRoutine --region cn-hangzhou --Name esa-edge-cache
-
-# b. 取 OSS 直传凭证
-aliyun esa GetRoutineStagingCodeUploadInfo --region cn-hangzhou --Name esa-edge-cache
-
-# c. 用 multipart/form-data POST 到返回的 OssPostConfig.Url，
-#    表单字段就是 OssPostConfig 的各键值对，另加一个文件字段（字段名 key、文件名 index.js）
-#    内容为 src/index.js，并带上 OSSAccessKeyId 与 x-oss-security-token
-
-# d. 提交
-aliyun esa CommitRoutineStagingCode --region cn-hangzhou --Name esa-edge-cache
-
-# e. 发布
-aliyun esa PublishRoutineCodeVersion --region cn-hangzhou \
-  --Name esa-edge-cache --Env production --CodeVersion "<b 步返回的 CodeVersion>"
-```
-
-之后同样用第 3 节的 `CreateRoutineRoute` 挂路由。`--Rule` 的表达式语法本地没有确认过，
-建议先用控制台配一条，再用 `ListRoutineRoutes` 抄回真实格式。
+| 现象 | 先查什么 |
+|---|---|
+| 部署成功但响应没有 `X-Astra-Edge-Weather` | 函数变量是否写进了**对应环境**；写完有没有**重新部署**；路由规则是否命中该 host+path |
+| 一直 `miss`、每次都在查上游 | 边缘 KV 最终一致，新写入的城市最长 300 秒才全球可见；再看 `ListKvs` 里有没有对应键 |
+| 全部 401 | 打的是预览地址但没带 `esa_er_token`；token 只有 1 小时 |
+| `/api/weather/` 返回源站的 400「请确保请求经过 Cloudflare」 | 说明请求透传回源了：检查 `request.info` 是否有 `ip_city_en`（用预览地址打一次即可看到）；源站那条分支仍是 CF-only 的旧实现 |
