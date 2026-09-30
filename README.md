@@ -43,8 +43,10 @@
 - **写入主动失效**：源站在写入响应里带 `X-Astra-Purge-Scopes`（逗号分隔的 `school/grade/class`，
   `usr-backend/router/client/putSchedule.go` 与 `router/web/helpers.go`），边缘据此删键。
   **头缺失或没有合法 scope 时不报错、不操作**——用户、认证这类接口本就与课表缓存无关。
-  注意：用户管理端的写请求打的是 `class.khbit.cn`，该站点没挂边缘路由，失效头目前到不了边缘，
-  手动改课表后要靠下面的到期时刻兜底（见 `docs/design.md` 8.3）；
+  注意：失效键按**写请求的 Host** 拼（`src/index.js:686-699`），所以要看管理端打哪个域名：SaaS 线
+  （`usr-dashboard` 的 `saas/main`）打的是登录页填写的租户域名，与客户端读取的 Host 一致，失效生效；
+  旧自托管线（`main` 的 `src/global.js:1` 硬编码 `class.khbit.cn`）没有边缘路由，失效头到不了边缘——
+  该线是自部署版本、不在线上运行。万一失效没到，靠下面的到期时刻兜底（见 `docs/design.md` 8.3）；
 - 版本串第三段是「下一次可能变化时刻」（源站 `service.VersionBoundary` 解析自动任务算出），
   越过它就必须回源：即使数据没变，快照也已跨出 7 天窗口；
 - **没有第三段时不写「永不过期」**：源站只在确实存在未来变化点时才给第三段

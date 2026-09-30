@@ -211,11 +211,18 @@ issue #63 的主体是「客户端带着本地 `version` 回来时直接在边�
 
 ### 8.3 已知风险
 
-- **写入失效目前到不了边缘**：源站已实现 `X-Astra-Purge-Scopes`
-  （`usr-backend/router/client/putSchedule.go`、`router/web/helpers.go`），但用户管理端的写请求打的是
-  `https://class.khbit.cn`（`usr-dashboard/src/global.js:1`），该站点没有挂边缘函数路由
-  （`aliyun esa ListSiteRoutes --SiteId 1154419338136032` → `TotalCount: 0`），失效头不会经过边缘。
-  手动改课表后，正命中的客户端要等存下来的到期时刻到点才看到新配置：有变化点时最迟第 7 天末，
+- **写入失效按写请求的 Host 拼键，两条管理端线的结果不同**：源站已在写入响应里带
+  `X-Astra-Purge-Scopes`（`usr-backend/router/client/putSchedule.go`、`router/web/helpers.go`），
+  边缘在 `handleMutating` 里用 `purgeKeysOf(hostOf(request), ...)` 删键
+  （`src/index.js:686-699`；只有非 GET/HEAD 才进这条路径，见 `src/index.js:82-84`）。键对不对得上，
+  取决于**写请求的 Host 是否等于客户端读取的 Host**：
+  - SaaS 线（`usr-dashboard` 的 `saas/main`，ESA Pages）：后端地址由登录页填写并存在 localStorage
+    （`src/views/Login.vue` 占位「例如：aaa-do.getastra.cn」、`src/global.js` 的 `getServer()`），
+    写请求 Host 与客户端读取的 Host 一致，站点路由也覆盖非 GET/OPTIONS，因此失效键能对上、失效生效；
+  - 旧自托管线（`main`）：`src/global.js:1` 硬编码 `https://class.khbit.cn`，该站点没有挂边缘路由
+    （`aliyun esa ListSiteRoutes --SiteId 1154419338136032` → `TotalCount: 0`），失效头到不了边缘。
+    这条线是自部署版本、目前不在线上运行，只作为地址填写示例保留。
+  写入失效没到边缘时，正命中的客户端最晚等存下来的到期时刻到点才看到新配置：有变化点时最迟第 7 天末，
   没有变化点时 600 秒；
 - **KV 最终一致**（第 6 节，最长 300 秒）：刚部署或刚写过时，有的 POP 还没有条目、有的还是旧条目，
   这些请求会回源一次；回源带 `version=0`，拿到 200 与最新快照，所以客户端能顺带更新自己的版本串；
