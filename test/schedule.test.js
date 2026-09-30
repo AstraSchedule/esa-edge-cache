@@ -263,6 +263,21 @@ describe('读路径', () => {
 		expect(calls.length).toBe(1);
 	});
 
+	test('version=0 一律回源并刷新 KV：手动「更新课表」能强制过期，不依赖写入失效', async () => {
+		const { res, calls, kv } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3', e: 0 })]],
+			search: '?version=0',
+			originVersion: '100:7:1791388800',
+		});
+
+		expect(res.status).toBe(200);
+		expect(calls.length).toBe(1);
+		expect(new URL(calls[0]).searchParams.get('version')).toBe('0');
+		expect(kv.data.get(SCHEDULE_KEY)).toBe(
+			JSON.stringify({ v: '100:7:1791388800', e: 1791388800 }),
+		);
+	});
+
 	test('源站回 304 时不改写 KV（不用请求者的私有第三段覆盖共享槽）', async () => {
 		const expired = NOW() - 1;
 		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: expired })]] });
