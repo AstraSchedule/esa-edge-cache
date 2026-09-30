@@ -288,22 +288,25 @@ describe('不带城市：用 request.info 定位客户端所在城市', () => {
 		expect(out.upstream).toHaveLength(0);
 	});
 
-	test('没有 request.info 时回源，不自造响应', async () => {
+	test('没有 request.info 时在边缘回 400，不回源', async () => {
 		const response = await call(request('/api/weather/'));
 
-		expect(await response.text()).toBe('origin');
-		expect(out.origin).toHaveLength(1);
+		expect(response.status).toBe(400);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('error');
+		expect((await response.json()).error).toContain('定位城市');
+		expect(out.origin).toHaveLength(0);
 		expect(out.upstream).toHaveLength(0);
 	});
 
-	test('info 里只有国家、没有城市时回源', async () => {
+	test('info 里只有国家、没有城市时同样在边缘回 400，不回源', async () => {
 		const response = await edgeWeather.fetch(
 			request('/api/weather/', {}, { ip_country_id: 'CN', ip_country_en: 'China' }),
 			{},
 			ENV,
 		);
 
-		expect(await response.text()).toBe('origin');
+		expect(response.status).toBe(400);
+		expect(out.origin).toHaveLength(0);
 		expect(out.upstream).toHaveLength(0);
 	});
 
@@ -322,46 +325,59 @@ describe('不带城市：用 request.info 定位客户端所在城市', () => {
 	});
 });
 
-describe('降级与旁路', () => {
-	test('没配函数变量时不接管，直接回源', async () => {
+describe('失败处理与旁路', () => {
+	test('没配函数变量时回 403，不回源也不查上游', async () => {
 		kv = installKv();
 		installFetch(defaultQweather);
 
 		const response = await call(request(weatherPath), {});
 
-		expect(await response.text()).toBe('origin');
+		expect(response.status).toBe(403);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('error');
+		expect((await response.json()).error).toContain('QW_API_HOST');
 		expect(out.upstream).toHaveLength(0);
-		expect(out.origin).toHaveLength(1);
+		expect(out.origin).toHaveLength(0);
 		expect(kv.data.size).toBe(0);
 	});
 
-	test('和风天气城市查询失败时回源', async () => {
+	test('和风天气城市查询失败时回 404「不存在」，不回源', async () => {
 		installFetch(() => jsonResponse({ code: '404' }));
 
 		const response = await call();
 
-		expect(await response.text()).toBe('origin');
-		expect(out.origin).toHaveLength(1);
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({
+			temp: '404',
+			weat: '不存在',
+			warning: '',
+			brief_warn: '',
+		});
+		expect(out.origin).toHaveLength(0);
 	});
 
-	test('和风天气实时天气失败（temp 为空）时回源', async () => {
+	test('和风天气实时天气失败（temp 为空）时回 502，不回源', async () => {
 		installFetch((url) => {
 			if (url.includes('/geo/v2/city/lookup')) return jsonResponse(LOCATION_BODY);
 			if (url.includes('/v7/weather/now')) return jsonResponse({ code: '200', now: {} });
 			return jsonResponse(ALERT_BODY);
 		});
 
-		expect(await (await call()).text()).toBe('origin');
-		expect(out.origin).toHaveLength(1);
+		const response = await call();
+
+		expect(response.status).toBe(502);
+		expect((await response.json()).error).toContain('超过最大重试次数');
+		expect(out.origin).toHaveLength(0);
 	});
 
-	test('和风天气返回非 200 或非 JSON 时回源', async () => {
+	test('和风天气返回非 200 或非 JSON 时由边缘作答，不回源', async () => {
+		// 城市查询（第一个上游请求）失败：源站 cityLookup 出任何错都是 404，边缘照抄
 		installFetch(() => new Response('boom', { status: 502 }));
-		expect(await (await call()).text()).toBe('origin');
-		expect(out.origin).toHaveLength(1);
+		expect((await call()).status).toBe(404);
+		expect(out.origin).toHaveLength(0);
 
 		installFetch(() => new Response('not json', { status: 200 }));
-		expect(await (await call()).text()).toBe('origin');
+		expect((await call()).status).toBe(404);
+		expect(out.origin).toHaveLength(0);
 	});
 
 	test('预警接口失败不影响天气返回', async () => {
@@ -418,15 +434,16 @@ describe('降级与旁路', () => {
 		expect(kv.data.size).toBe(0);
 	});
 
-	test('函数内部抛异常时回源，不把异常抛给客户端', async () => {
+	test('上游抛异常时回 502，既不回源也不把异常抛给客户端', async () => {
 		installFetch(() => {
 			throw new Error('upstream exploded');
 		});
 
 		const response = await call();
 
-		expect(await response.text()).toBe('origin');
-		expect(out.origin).toHaveLength(1);
+		expect(response.status).toBe(502);
+		expect(response.headers.get('X-Astra-Edge-Weather')).toBe('error');
+		expect(out.origin).toHaveLength(0);
 	});
 });
 
@@ -447,14 +464,15 @@ describe('上游请求', () => {
 		expect(alert.url.endsWith('/39.90499/116.40529')).toBe(true);
 	});
 
-	test('环境变量主机名非法时完全不发起上游请求，直接回源', async () => {
+	test('环境变量主机名非法时不发起上游请求，按未配置回 403', async () => {
 		const response = await call(request(weatherPath), {
 			QW_API_HOST: 'evil.example.com/x?',
 			QW_API_KEY: QW_KEY,
 		});
 
-		expect(await response.text()).toBe('origin');
+		expect(response.status).toBe(403);
 		expect(out.upstream).toHaveLength(0);
+		expect(out.origin).toHaveLength(0);
 	});
 });
 

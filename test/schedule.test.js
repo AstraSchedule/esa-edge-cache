@@ -143,7 +143,36 @@ describe('读路径', () => {
 		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: 'v1', e: NOW() - 1 })]] });
 		const calls = installFetch(() => scheduleBody('v1'));
 
-		const res = await edgeCache.fetch(scheduleRequest('', '?version=v1'), {}, {});
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=v1'), {}, {});
+
+		expect(res.status).toBe(200);
+		expect(calls.length).toBe(1);
+	});
+
+	test('版本串没有变化点段时写软过期，不写「永不过期」', async () => {
+		const kv = installKv({});
+		installFetch(() => scheduleBody('100:3'));
+
+		const first = await edgeCache.fetch(scheduleRequest(), {}, {});
+
+		expect(first.status).toBe(200);
+		const stored = JSON.parse(kv.data.get(SCHEDULE_KEY));
+		expect(stored.v).toBe('100:3');
+		// 没有变化点 ≠ 永不过期：到期时刻必须有界且非 0
+		expect(stored.e).toBeGreaterThan(NOW());
+		expect(stored.e).toBeLessThanOrEqual(NOW() + 600);
+
+		// 软过期未到之前，同一版本仍然命中 304
+		const second = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
+		expect(second.status).toBe(304);
+		expect(second.headers.get('X-Astra-Edge-Schedule')).toBe('hit');
+	});
+
+	test('软过期到点后回源复核，不再替客户端答 304', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3', e: NOW() - 1 })]] });
+		const calls = installFetch(() => scheduleBody('100:3'));
+
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);

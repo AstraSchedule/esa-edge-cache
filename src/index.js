@@ -7,18 +7,19 @@
  * 源站函数完全不参与这条路径。
  *
  * 设计要点（取舍与实测见 docs/design.md）：
- *  1. 只接管 `GET /api/weather/<城市>[/<省份>]`；其余请求一律 `fetch(request)` 透传，
- *     本函数不改变任何其他接口的行为。
+ *  1. 只接管 `GET /api/weather/<城市>[/<省份>]` 与 `GET /api/weather/`；其余请求一律
+ *     `fetch(request)` 透传，本函数不改变任何其他接口的行为。
  *  2. 缓存整个响应体，TTL 10 分钟——与源站 `cache.CachePage(10*time.Minute)` 一致。
  *     和风天气按次计费且有免费额度，边缘必须挡在它前面。
- *  3. 任何一步失败（环境变量没配、和风天气报错、响应格式不认识、KV 抛异常）都降级成
- *     `fetch(request)` 回源，由源站按原有逻辑处理。边缘只做加速，不做单点。
- *  4. 不带城市的 `/api/weather/` 同样在边缘处理：城市取 ESA 运行时 `request.info`
- *     里由客户端 IP 定位到的 `ip_city_en`（替代原先 Cloudflare 的 CF-IPCity），
- *     定位不到才回源。
+ *  3. **天气一旦被本函数认出，就绝不回源**：函数变量没配、和风天气报错、响应格式不认识、
+ *     函数内部抛异常，全部由边缘自己按源站的错误契约作答（状态码与 JSON 键同形，见
+ *     weatherError）。把失败推回源站解决不了问题——源站那条分支依赖的定位头在 ESA 上同样
+ *     不存在，只会稳定回 400——却会把天气流量重新压回 FC，正是这个函数要消灭的东西。
+ *  4. 不带城市的 `/api/weather/`：城市取 ESA 运行时 `request.info` 里由客户端 IP 定位到的
+ *     `ip_city_en`（替代原先 Cloudflare 的 CF-IPCity）；定位不到时按源站同形的 400 作答。
  *
- * 注意：课表版本缓存（issue #63 的另一半）**不在**本函数里。等自动任务（desktop#57）
- * 落地、版本串语义稳定后再单独加；届时用 `s1.` / `g1.` 前缀，与本函数的 `w1.` 不冲突。
+ * 课表版本缓存（issue #63 的另一半）在本文件后半段：`handleSchedule`，键前缀 `s1.`，
+ * 与天气的 `w1.` 并列在同一个边缘 KV 存储空间。
  */
 
 /** ESA 边缘 KV 存储空间名称，与控制台/OpenAPI 中创建的 NameSpace 一致 */
@@ -34,8 +35,31 @@ const CACHE_TTL_SECONDS = 600;
 const ENV_API_HOST = 'QW_API_HOST';
 const ENV_API_KEY = 'QW_API_KEY';
 
-/** 标记本响应是否由边缘产出，用于线上验证与排障 */
+/** 标记本响应是否由边缘产出，用于线上验证与排障：hit（命中缓存）/ miss（边缘现取）/ error（边缘就地判定的失败） */
 const EDGE_HEADER = 'X-Astra-Edge-Weather';
+
+/**
+ * 失败时返回的响应体。状态码与 JSON 键与源站逐个对齐
+ * （usr-backend/router/client/getWeather.go）：客户端只按「是否 2xx」决定要不要重试，
+ * 所以状态码是硬契约，键名是给排障的人看的。
+ * 403/400 的文案改写成边缘的处置建议——源站那句「请配置 JWT（kid/project_id/private_key_pem）」
+ * 「请确保请求经过 ESA 或 Cloudflare」在边缘都不成立，照抄只会误导。
+ */
+const BODY_NO_CREDENTIAL = JSON.stringify({
+	error: '未配置天气认证信息：请在 ESA 边缘函数的函数变量中配置 QW_API_HOST 与 QW_API_KEY',
+});
+const BODY_NO_CITY = JSON.stringify({
+	error: '无法从客户端 IP 定位城市：请求可能没有经过 ESA 边缘节点，或运行时 request.info 缺少 ip_city_en',
+});
+const BODY_NOT_FOUND = JSON.stringify({
+	temp: '404',
+	weat: '不存在',
+	warning: '',
+	brief_warn: '',
+});
+const BODY_UPSTREAM_ERROR = JSON.stringify({
+	error: '获取天气信息失败，超过最大重试次数，可能是上游服务器异常，或是本服务器存在网络波动',
+});
 
 /** 城市名/省份名的长度上限，挡住畸形路径把超长串塞进上游 URL 与 KV 键 */
 const MAX_QUERY_LENGTH = 64;
@@ -78,14 +102,18 @@ export default {
 				return response;
 			}
 		} catch (e) {
-			// 同上：天气边缘失败一律回源
+			// 只有「还没认出路径」（例如 new URL 抛异常）才会走到这里；认出之后
+			// handleWeather 内部已自兜底，不会把异常漏到这一层。
 		}
 		return fetch(request);
 	},
 };
 
 /**
- * 只负责天气这一条路径；返回 null 表示「不接管，交给调用方回源」。
+ * 只负责天气这一条路径；返回 null 表示「这不是天气请求，交给调用方回源」。
+ *
+ * 认出天气路径之后**必定返回一个 Response**（不会再返回 null）：天气请求不回源，
+ * 见文件头第 3 点。
  */
 async function handleWeather(request, env, context) {
 	if (String(request.method || 'GET').toUpperCase() !== 'GET') {
@@ -96,15 +124,29 @@ async function handleWeather(request, env, context) {
 	if (!query) {
 		return null;
 	}
+
+	try {
+		return await serveWeather(request, query, env, context);
+	} catch (e) {
+		// 边缘自己出错也不回源：给客户端一个源站同形的 502，让它按原有逻辑重试
+		return weatherError(502, BODY_UPSTREAM_ERROR);
+	}
+}
+
+/**
+ * 天气路径的实际处理。每一步失败都就地转成响应，没有「返回 null 回源」这条路。
+ */
+async function serveWeather(request, query, env, context) {
 	const config = readConfig(env, context);
 	if (!config) {
-		return null;
+		// 边缘没配和风天气凭据 → 取不到数，按源站「未配置天气认证信息」同状态码作答
+		return weatherError(403, BODY_NO_CREDENTIAL);
 	}
 
-	// 不带城市的那条路径靠客户端 IP 定位；定位不到就回源，由源站决定响应
+	// 不带城市的那条路径靠客户端 IP 定位
 	const located = query.name === '' ? geoQueryOf(request) : query;
 	if (!located) {
-		return null;
+		return weatherError(400, BODY_NO_CITY);
 	}
 
 	const store = createStore();
@@ -117,15 +159,18 @@ async function handleWeather(request, env, context) {
 		}
 	}
 
-	const body = await fetchWeather(config, located);
-	if (body === null) {
-		return null;
+	const result = await fetchWeather(config, located);
+	if (!result.ok) {
+		// 与源站的两条失败分支对齐：城市查不到 → 404「不存在」；上游取数失败 → 502
+		return result.reason === 'location'
+			? weatherError(404, BODY_NOT_FOUND)
+			: weatherError(502, BODY_UPSTREAM_ERROR);
 	}
 
 	if (store) {
-		await writeCache(store, cacheKey, body);
+		await writeCache(store, cacheKey, result.body);
 	}
-	return weatherResponse(body, 'miss');
+	return weatherResponse(result.body, 'miss');
 }
 
 /**
@@ -226,8 +271,8 @@ export function cacheKeyOf(query) {
  * 读取和风天气的凭据。两个键都由函数变量下发（控制台「函数变量」或 esa-cli 的
  * env/secret），键名只能由字母数字下划线组成；敏感值建议用加密存储。
  *
- * 任一项缺失都返回 null —— 不接管、直接回源，未配置环境变量的部署行为与今天完全一致。
- * 除了文档承诺的第三个参数，也顺带看一眼 context：两个都不是时只回源，不会报错。
+ * 任一项缺失都返回 null —— 边缘取不到数，由调用方按 403 作答（不回源，见文件头第 3 点）。
+ * 除了文档承诺的第三个参数，也顺带看一眼 context：两个都不是时只返回 null，不会报错。
  */
 export function readConfig(env, context) {
 	const host = pickString([env, context], ENV_API_HOST).trim();
@@ -248,18 +293,25 @@ function pickString(sources, name) {
 	return '';
 }
 
+/**
+ * 查和风天气。返回 `{ ok: true, body }` 或 `{ ok: false, reason }`。
+ *
+ * `reason` 区分「城市查不到」（源站回 404）与「上游取数失败」（源站回 502），
+ * 好让边缘给出与源站一致的状态码——源站的 cityLookup 出任何错都是 404，
+ * 所以这里 lookupLocation 失败一律记 location。
+ */
 async function fetchWeather(config, query) {
 	const location = await lookupLocation(config, query);
 	if (!location) {
-		return null;
+		return { ok: false, reason: 'location' };
 	}
 	const now = await lookupNow(config, location.id);
 	if (!now) {
-		return null;
+		return { ok: false, reason: 'upstream' };
 	}
 	// 预警拿不到不算失败：源站也是这么处理的（warnResp, _ := ...）
 	const alerts = await lookupWarning(config, location);
-	return buildWeatherBody(location, now, alerts);
+	return { ok: true, body: buildWeatherBody(location, now, alerts) };
 }
 
 /** `GET /geo/v2/city/lookup`：城市名 → 城市 ID 与经纬度 */
@@ -437,6 +489,17 @@ function weatherResponse(body, state) {
 	});
 }
 
+/** 边缘就地判定的失败响应：状态码与响应体都按源站的契约给，只是不再回源 */
+function weatherError(status, body) {
+	return new Response(body, {
+		status,
+		headers: {
+			'content-type': 'application/json; charset=utf-8',
+			[EDGE_HEADER]: 'error',
+		},
+	});
+}
+
 function nowSeconds() {
 	return Math.floor(Date.now() / 1000);
 }
@@ -503,6 +566,17 @@ const SCHEDULE_KEY_PREFIX = 's1.';
 
 /** 标记本次响应的课表版本判定结果，用于线上验证与排障 */
 const SCHEDULE_EDGE_HEADER = 'X-Astra-Edge-Schedule';
+
+/**
+ * 版本串没有变化点段（`dataVersion:week`）时的软过期时长（秒）。
+ *
+ * 没有变化点只说明「没有已知的未来变化点」，不代表版本串不再变：数据版本会因
+ * 任意一次课表写入而推进，教学周每周也会前进。把这种情况当成「永不过期」
+ * （存 e=0），边缘就会一直替客户端答 304，客户端永久停在旧课表；源站侧同一
+ * 故障见 usr-backend/router/client/version_test.go。
+ * 这里改为让它定期回源复核，陈旧窗口有上界；回源只是一次廉价的课表查询。
+ */
+const SCHEDULE_SOFT_TTL_SECONDS = CACHE_TTL_SECONDS;
 
 /**
  * 源站用它声明「这次写入让哪些班级的缓存失效」，值是以逗号分隔的 school/grade/class。
@@ -673,10 +747,12 @@ async function writeScheduleVersion(store, key, version) {
 	if (!normalized) {
 		return;
 	}
+	const boundary = scheduleBoundaryOf(normalized);
+	const expiresAt = boundary > 0 ? boundary : nowSeconds() + SCHEDULE_SOFT_TTL_SECONDS;
 	try {
 		await store.put(
 			key,
-			JSON.stringify({ v: normalized, e: scheduleBoundaryOf(normalized) }),
+			JSON.stringify({ v: normalized, e: expiresAt }),
 		);
 	} catch (e) {
 		// 写失败只影响下一次能否命中，本次响应照常返回
@@ -699,7 +775,9 @@ export function versionOfScheduleBody(text) {
 
 /**
  * 版本串第三段是「下一次可能变化时刻」（Unix 秒），源站 scheduleVersion 生成；
- * 没有该段说明之后不会再变，返回 0。
+ * 没有该段说明当前没有已知的未来变化点，返回 0。
+ * 注意：0 只代表「没有已知变化点」，不代表版本串不会再变 —— 写 KV 时不会存 0，
+ * 而是存 SCHEDULE_SOFT_TTL_SECONDS 之后的软过期时刻。
  */
 export function scheduleBoundaryOf(version) {
 	const parts = String(version || '').split(':');
@@ -710,7 +788,10 @@ export function scheduleBoundaryOf(version) {
 	return Number.isFinite(boundary) && boundary > 0 ? Math.floor(boundary) : 0;
 }
 
-/** 越过变化点就必须回源：即使版本串没变，命中结果也已经不同了 */
+/**
+ * 越过存下来的过期时刻就必须回源：即使版本串没变，命中结果也可能已经不同了。
+ * 到期时刻要么是变化点，要么是没有变化点时的软过期时刻（都 > 0）。
+ */
 function scheduleExpired(boundary) {
 	return boundary > 0 && nowSeconds() >= boundary;
 }
