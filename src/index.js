@@ -7,18 +7,19 @@
  * 源站函数完全不参与这条路径。
  *
  * 设计要点（取舍与实测见 docs/design.md）：
- *  1. 只接管 `GET /api/weather/<城市>[/<省份>]`；其余请求一律 `fetch(request)` 透传，
- *     本函数不改变任何其他接口的行为。
+ *  1. 只接管 `GET /api/weather/<城市>[/<省份>]` 与 `GET /api/weather/`；其余请求一律
+ *     `fetch(request)` 透传，本函数不改变任何其他接口的行为。
  *  2. 缓存整个响应体，TTL 10 分钟——与源站 `cache.CachePage(10*time.Minute)` 一致。
  *     和风天气按次计费且有免费额度，边缘必须挡在它前面。
- *  3. 任何一步失败（环境变量没配、和风天气报错、响应格式不认识、KV 抛异常）都降级成
- *     `fetch(request)` 回源，由源站按原有逻辑处理。边缘只做加速，不做单点。
- *  4. 不带城市的 `/api/weather/` 同样在边缘处理：城市取 ESA 运行时 `request.info`
- *     里由客户端 IP 定位到的 `ip_city_en`（替代原先 Cloudflare 的 CF-IPCity），
- *     定位不到才回源。
+ *  3. **天气一旦被本函数认出，就绝不回源**：函数变量没配、和风天气报错、响应格式不认识、
+ *     函数内部抛异常，全部由边缘自己按源站的错误契约作答（状态码与 JSON 键同形，见
+ *     weatherError）。把失败推回源站解决不了问题——源站那条分支依赖的定位头在 ESA 上同样
+ *     不存在，只会稳定回 400——却会把天气流量重新压回 FC，正是这个函数要消灭的东西。
+ *  4. 不带城市的 `/api/weather/`：城市取 ESA 运行时 `request.info` 里由客户端 IP 定位到的
+ *     `ip_city_en`（替代原先 Cloudflare 的 CF-IPCity）；定位不到时按源站同形的 400 作答。
  *
- * 注意：课表版本缓存（issue #63 的另一半）**不在**本函数里。等自动任务（desktop#57）
- * 落地、版本串语义稳定后再单独加；届时用 `s1.` / `g1.` 前缀，与本函数的 `w1.` 不冲突。
+ * 课表版本缓存（issue #63 的另一半）在本文件后半段：`handleSchedule`，键前缀 `s1.`，
+ * 与天气的 `w1.` 并列在同一个边缘 KV 存储空间。
  */
 
 /** ESA 边缘 KV 存储空间名称，与控制台/OpenAPI 中创建的 NameSpace 一致 */
@@ -34,8 +35,31 @@ const CACHE_TTL_SECONDS = 600;
 const ENV_API_HOST = 'QW_API_HOST';
 const ENV_API_KEY = 'QW_API_KEY';
 
-/** 标记本响应是否由边缘产出，用于线上验证与排障 */
+/** 标记本响应是否由边缘产出，用于线上验证与排障：hit（命中缓存）/ miss（边缘现取）/ error（边缘就地判定的失败） */
 const EDGE_HEADER = 'X-Astra-Edge-Weather';
+
+/**
+ * 失败时返回的响应体。状态码与 JSON 键与源站逐个对齐
+ * （usr-backend/router/client/getWeather.go）：客户端只按「是否 2xx」决定要不要重试，
+ * 所以状态码是硬契约，键名是给排障的人看的。
+ * 403/400 的文案改写成边缘的处置建议——源站那句「请配置 JWT（kid/project_id/private_key_pem）」
+ * 「请确保请求经过 ESA 或 Cloudflare」在边缘都不成立，照抄只会误导。
+ */
+const BODY_NO_CREDENTIAL = JSON.stringify({
+	error: '未配置天气认证信息：请在 ESA 边缘函数的函数变量中配置 QW_API_HOST 与 QW_API_KEY',
+});
+const BODY_NO_CITY = JSON.stringify({
+	error: '无法从客户端 IP 定位城市：请求可能没有经过 ESA 边缘节点，或运行时 request.info 缺少 ip_city_en',
+});
+const BODY_NOT_FOUND = JSON.stringify({
+	temp: '404',
+	weat: '不存在',
+	warning: '',
+	brief_warn: '',
+});
+const BODY_UPSTREAM_ERROR = JSON.stringify({
+	error: '获取天气信息失败，超过最大重试次数，可能是上游服务器异常，或是本服务器存在网络波动',
+});
 
 /** 城市名/省份名的长度上限，挡住畸形路径把超长串塞进上游 URL 与 KV 键 */
 const MAX_QUERY_LENGTH = 64;
@@ -78,14 +102,18 @@ export default {
 				return response;
 			}
 		} catch (e) {
-			// 同上：天气边缘失败一律回源
+			// 只有「还没认出路径」（例如 new URL 抛异常）才会走到这里；认出之后
+			// handleWeather 内部已自兜底，不会把异常漏到这一层。
 		}
 		return fetch(request);
 	},
 };
 
 /**
- * 只负责天气这一条路径；返回 null 表示「不接管，交给调用方回源」。
+ * 只负责天气这一条路径；返回 null 表示「这不是天气请求，交给调用方回源」。
+ *
+ * 认出天气路径之后**必定返回一个 Response**（不会再返回 null）：天气请求不回源，
+ * 见文件头第 3 点。
  */
 async function handleWeather(request, env, context) {
 	if (String(request.method || 'GET').toUpperCase() !== 'GET') {
@@ -96,15 +124,32 @@ async function handleWeather(request, env, context) {
 	if (!query) {
 		return null;
 	}
+
+	try {
+		return await serveWeather(request, query, env, context);
+	} catch (e) {
+		// 源站 stats.go 的 recordWeatherError 只统计源站侧的上游失败，边缘这边的失败
+		// 观测不到，所以必须留下日志（docs/design.md：观测口径需要用边缘日志补齐）
+		console.error('weather edge error', e && e.message);
+		// 边缘自己出错也不回源：给客户端一个源站同形的 502，让它按原有逻辑重试
+		return weatherError(502, BODY_UPSTREAM_ERROR);
+	}
+}
+
+/**
+ * 天气路径的实际处理。每一步失败都就地转成响应，没有「返回 null 回源」这条路。
+ */
+async function serveWeather(request, query, env, context) {
 	const config = readConfig(env, context);
 	if (!config) {
-		return null;
+		// 边缘没配和风天气凭据 → 取不到数，按源站「未配置天气认证信息」同状态码作答
+		return weatherError(403, BODY_NO_CREDENTIAL);
 	}
 
-	// 不带城市的那条路径靠客户端 IP 定位；定位不到就回源，由源站决定响应
+	// 不带城市的那条路径靠客户端 IP 定位
 	const located = query.name === '' ? geoQueryOf(request) : query;
 	if (!located) {
-		return null;
+		return weatherError(400, BODY_NO_CITY);
 	}
 
 	const store = createStore();
@@ -117,15 +162,18 @@ async function handleWeather(request, env, context) {
 		}
 	}
 
-	const body = await fetchWeather(config, located);
-	if (body === null) {
-		return null;
+	const result = await fetchWeather(config, located);
+	if (!result.ok) {
+		// 与源站的两条失败分支对齐：城市查不到 → 404「不存在」；上游取数失败 → 502
+		return result.reason === 'location'
+			? weatherError(404, BODY_NOT_FOUND)
+			: weatherError(502, BODY_UPSTREAM_ERROR);
 	}
 
 	if (store) {
-		await writeCache(store, cacheKey, body);
+		await writeCache(store, cacheKey, result.body);
 	}
-	return weatherResponse(body, 'miss');
+	return weatherResponse(result.body, 'miss');
 }
 
 /**
@@ -226,8 +274,8 @@ export function cacheKeyOf(query) {
  * 读取和风天气的凭据。两个键都由函数变量下发（控制台「函数变量」或 esa-cli 的
  * env/secret），键名只能由字母数字下划线组成；敏感值建议用加密存储。
  *
- * 任一项缺失都返回 null —— 不接管、直接回源，未配置环境变量的部署行为与今天完全一致。
- * 除了文档承诺的第三个参数，也顺带看一眼 context：两个都不是时只回源，不会报错。
+ * 任一项缺失都返回 null —— 边缘取不到数，由调用方按 403 作答（不回源，见文件头第 3 点）。
+ * 除了文档承诺的第三个参数，也顺带看一眼 context：两个都不是时只返回 null，不会报错。
  */
 export function readConfig(env, context) {
 	const host = pickString([env, context], ENV_API_HOST).trim();
@@ -248,18 +296,25 @@ function pickString(sources, name) {
 	return '';
 }
 
+/**
+ * 查和风天气。返回 `{ ok: true, body }` 或 `{ ok: false, reason }`。
+ *
+ * `reason` 区分「城市查不到」（源站回 404）与「上游取数失败」（源站回 502），
+ * 好让边缘给出与源站一致的状态码——源站的 cityLookup 出任何错都是 404，
+ * 所以这里 lookupLocation 失败一律记 location。
+ */
 async function fetchWeather(config, query) {
 	const location = await lookupLocation(config, query);
 	if (!location) {
-		return null;
+		return { ok: false, reason: 'location' };
 	}
 	const now = await lookupNow(config, location.id);
 	if (!now) {
-		return null;
+		return { ok: false, reason: 'upstream' };
 	}
 	// 预警拿不到不算失败：源站也是这么处理的（warnResp, _ := ...）
 	const alerts = await lookupWarning(config, location);
-	return buildWeatherBody(location, now, alerts);
+	return { ok: true, body: buildWeatherBody(location, now, alerts) };
 }
 
 /** `GET /geo/v2/city/lookup`：城市名 → 城市 ID 与经纬度 */
@@ -437,6 +492,17 @@ function weatherResponse(body, state) {
 	});
 }
 
+/** 边缘就地判定的失败响应：状态码与响应体都按源站的契约给，只是不再回源 */
+function weatherError(status, body) {
+	return new Response(body, {
+		status,
+		headers: {
+			'content-type': 'application/json; charset=utf-8',
+			[EDGE_HEADER]: 'error',
+		},
+	});
+}
+
 function nowSeconds() {
 	return Math.floor(Date.now() / 1000);
 }
@@ -512,6 +578,20 @@ const SCHEDULE_EDGE_HEADER = 'X-Astra-Edge-Schedule';
 const PURGE_SCOPES_HEADER = 'X-Astra-Purge-Scopes';
 
 /**
+ * 回源请求：把 version 换成 0，强制源站重新计算整周快照。
+ * 构造失败时退回原请求——那样最多拿回一个 304（客户端数据仍然是对的），不影响本次响应。
+ */
+function scheduleOriginRequest(request) {
+	try {
+		const url = new URL(request.url);
+		url.searchParams.set('version', '0');
+		return new Request(url.toString(), request);
+	} catch (e) {
+		return request;
+	}
+}
+
+/**
  * 只接管「客户端课表读取」：GET + 恰好三段路径 + 带 version 查询参数。
  * version 参数是客户端独有的判据——管理端读配置走 /web/config/...，不带该参数。
  * 返回 null 表示不接管，交给调用方回源。
@@ -533,21 +613,33 @@ async function handleSchedule(request, env, context) {
 	const clientVersion = String(url.searchParams.get('version') || '');
 	const cached = await readScheduleCache(store, key);
 
-	// 命中：客户端版本与缓存一致，且还没走到「下一次可能变化」的时刻 → 304
-	if (cached && cached.v === clientVersion && !scheduleExpired(cached.e)) {
+	// 命中判据与源站 304 判据对齐：只比「数据版本 + 教学周」这两件有身份意义的事实。
+	// 版本串第三段是「最后一次生成快照那天 + 7 天」的滑动值（源站 service.VersionBoundary 里
+	// dateOnly(now).AddDate(0, 0, 7)）：每台设备最后一次拿到 200 的日期不同，手上的值就不同。
+	// 拿它做整串比较时，同一个班在边缘（只有一个 KV 槽）只能命中其中一台设备的串，其余全部回源，
+	// 而源站对它们一律答 304 —— 这正是「本该在边缘答 304 的请求抵达源站」的原因。
+	// 第三段只在 e 到点时触发一次回源复核；e = 0 表示源站当时没有已知的未来变化点
+	// （源站 scheduleVersion 此时同样省略第三段），按源站口径就是「304 长期有效」，
+	// 边缘不另加自造上界——陈旧窗口只由写入失效（删键）强制关闭。
+	if (
+		cached &&
+		!scheduleExpired(cached.e) &&
+		sameScheduleIdentity(cached.v, clientVersion)
+	) {
 		return new Response(null, {
 			status: 304,
 			headers: { [SCHEDULE_EDGE_HEADER]: 'hit' },
 		});
 	}
 
-	// 回源：原样透传（version 参数必须带上，源站要按三段解析它）
-	const response = await fetch(request);
+	// 回源带 version=0：源站不再用第三段判定 304，原样透传客户端版本只会换回一个没有响应体的
+	// 304，边缘学不到源站当前的变化点；带 0 强制源站重算整周快照，才能把版本与到期时刻写进 KV。
+	const response = await fetch(scheduleOriginRequest(request));
 
-	// 304：说明客户端带来的版本就是源站当前版本，把它写进 KV，
-	// 否则这次回源白跑、KV 永远填不上（304 没有响应体，只能这样补）
+	// 源站回 304（回源带的是 version=0，正常路径下不会发生：只可能是源站还在用第三段判定，
+	// 或运行时没接受改写后的请求）。无论哪种，**不能**把客户端那串写进 KV——那是拿请求者的私有值
+	// 覆盖共享槽，同一个班的不同第三段互相踩，回源永远不收敛（源站只认数据版本与教学周，不会纠正它们）。
 	if (response.status === 304) {
-		await writeScheduleVersion(store, key, clientVersion);
 		return new Response(null, {
 			status: 304,
 			headers: { [SCHEDULE_EDGE_HEADER]: 'revalidated' },
@@ -667,16 +759,23 @@ async function readScheduleCache(store, key) {
 	}
 }
 
-/** 写入版本；写失败只影响下一次能否命中，本次响应照常返回 */
+/**
+ * 写入版本与到期时刻。到期时刻只取源站给的第三段（下一次可能变化时刻）；没有该段就存 0：
+ * 源站 scheduleVersion 同样在没有已知未来变化点时省略第三段，语义是 304 长期有效
+ * （usr-backend/router/client/getSchedule.go:186-197），边缘不另加上界。
+ * 陈旧窗口由写入操作强制关闭：源站写入响应带 X-Astra-Purge-Scopes，handleMutating 删键后
+ * 下一次读回源即拿到新的数据版本。写失败只影响下一次能否命中，本次响应照常返回。
+ */
 async function writeScheduleVersion(store, key, version) {
 	const normalized = String(version || '');
 	if (!normalized) {
 		return;
 	}
+	const expiresAt = scheduleBoundaryOf(normalized);
 	try {
 		await store.put(
 			key,
-			JSON.stringify({ v: normalized, e: scheduleBoundaryOf(normalized) }),
+			JSON.stringify({ v: normalized, e: expiresAt }),
 		);
 	} catch (e) {
 		// 写失败只影响下一次能否命中，本次响应照常返回
@@ -699,7 +798,9 @@ export function versionOfScheduleBody(text) {
 
 /**
  * 版本串第三段是「下一次可能变化时刻」（Unix 秒），源站 scheduleVersion 生成；
- * 没有该段说明之后不会再变，返回 0。
+ * 没有该段说明当前没有已知的未来变化点，返回 0，原样写进 KV。
+ * 0 只代表「没有已知变化点」，不代表版本串不会再变；但源站在这种情况下同样省略第三段、
+ * 由写入推进 dataVersion 兜底，所以边缘不另加自造上界，陈旧窗口交给写入失效删键。
  */
 export function scheduleBoundaryOf(version) {
 	const parts = String(version || '').split(':');
@@ -710,7 +811,45 @@ export function scheduleBoundaryOf(version) {
 	return Number.isFinite(boundary) && boundary > 0 ? Math.floor(boundary) : 0;
 }
 
-/** 越过变化点就必须回源：即使版本串没变，命中结果也已经不同了 */
+/**
+ * 解析版本串 dataVersion:weekNumber[:变化点]，与源站 parseScheduleVersion 同口径：
+ * 只认前两段，第二段之后（变化点）一律忽略，因此客户端可以不带它；
+ * 只有一段时按旧客户端的纯数据版本处理，week 记 0（与任何 week >= 1 的复合版本都不同）。
+ * 数据版本不是整数、或教学周不是 >= 1 的整数时返回 null，调用方一律按「不同」处理（回源更安全）。
+ */
+export function parseScheduleVersion(version) {
+	const parts = String(version == null ? '' : version).split(':');
+	const dataVersion = versionToNumber(parts[0]);
+	if (dataVersion === null) {
+		return null;
+	}
+	if (parts.length < 2) {
+		return { dataVersion, week: 0 };
+	}
+	const week = versionToNumber(parts[1]);
+	if (week === null || week < 1) {
+		return null;
+	}
+	return { dataVersion, week };
+}
+
+/** 两个版本串的身份部分（数据版本 + 教学周）是否相同；任一侧解析不出来都算不同 */
+export function sameScheduleIdentity(left, right) {
+	const a = parseScheduleVersion(left);
+	const b = parseScheduleVersion(right);
+	return !!a && !!b && a.dataVersion === b.dataVersion && a.week === b.week;
+}
+
+function versionToNumber(part) {
+	const text = String(part == null ? '' : part);
+	return /^[+-]?\d+$/.test(text) ? Number(text) : null;
+}
+
+/**
+ * 越过存下来的到期时刻就必须回源：即使版本串没变，命中结果也可能已经不同了。
+ * 到期时刻就是源站给的第三段变化点（> 0）；e = 0 表示当时没有已知的未来变化点，
+ * 永不到点——过期只能由写入失效（X-Astra-Purge-Scopes 触发的删键）强制。
+ */
 function scheduleExpired(boundary) {
 	return boundary > 0 && nowSeconds() >= boundary;
 }
