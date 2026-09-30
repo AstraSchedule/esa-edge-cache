@@ -2,7 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import edgeCache, {
 	classPathOf,
 	keyOfScheduleParts,
+	parseScheduleVersion,
 	purgeKeysOf,
+	sameScheduleIdentity,
 	scheduleBoundaryOf,
 	versionOfScheduleBody,
 } from '../src/index.js';
@@ -108,6 +110,21 @@ describe('路径与键', () => {
 		expect(scheduleBoundaryOf('100:3:abc')).toBe(0);
 	});
 
+	test('版本串只按前两段判身份，第三段忽略', () => {
+		expect(parseScheduleVersion('100:3:200')).toEqual({ dataVersion: 100, week: 3 });
+		expect(parseScheduleVersion('100:3')).toEqual({ dataVersion: 100, week: 3 });
+		expect(parseScheduleVersion('100')).toEqual({ dataVersion: 100, week: 0 });
+		expect(parseScheduleVersion('100:0')).toBeNull();
+		expect(parseScheduleVersion('100:abc')).toBeNull();
+		expect(parseScheduleVersion('abc:3')).toBeNull();
+		expect(parseScheduleVersion('')).toBeNull();
+		expect(sameScheduleIdentity('100:3:5', '100:3:999')).toBe(true);
+		expect(sameScheduleIdentity('100:3', '100:3:999')).toBe(true);
+		expect(sameScheduleIdentity('100:4:5', '100:3:5')).toBe(false);
+		expect(sameScheduleIdentity('100:3:5', 'v1')).toBe(false);
+		expect(sameScheduleIdentity('', '')).toBe(false);
+	});
+
 	test('从响应体取 version', () => {
 		expect(versionOfScheduleBody('{"version":"1:2:3"}')).toBe('1:2:3');
 		expect(versionOfScheduleBody('not json')).toBe('');
@@ -116,34 +133,95 @@ describe('路径与键', () => {
 });
 
 describe('读路径', () => {
-	test('KV 命中且未过变化点 → 304，不回源', async () => {
-		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: 'v1', e: NOW() + 3600 })]] });
+	test('同数据版本/教学周、第三段不同但未到变化点 → 304，不回源', async () => {
+		// 线上故障的核心用例：同一个班的多台设备各带自己那天生成的第三段，
+		// 源站只会答 304，边缘必须也能就地答 304，不能再回源
+		const kv = installKv({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:1791388800', e: NOW() + 3600 })]],
+		});
 		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
 
-		const res = await edgeCache.fetch(scheduleRequest(), {}, {});
+		const res = await edgeCache.fetch(
+			scheduleRequest('/39/2023/1', '?version=100:3:1791129600'),
+			{},
+			{},
+		);
 
 		expect(res.status).toBe(304);
+		expect(res.headers.get('X-Astra-Edge-Schedule')).toBe('hit');
 		expect(calls.length).toBe(0);
 		expect(kv.deleted.length).toBe(0);
 	});
 
-	test('版本不同 → 回源，并按响应体刷新 KV', async () => {
-		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: 'old', e: NOW() + 3600 })]] });
+	test('版本串完全相同也命中 304', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() + 3600 })]] });
+		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
+
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:200'), {}, {});
+
+		expect(res.status).toBe(304);
+		expect(calls.length).toBe(0);
+	});
+
+	test('客户端不带第三段（纯 dataVersion:week）同样命中', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:1791388800', e: NOW() + 3600 })]] });
+		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
+
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
+
+		expect(res.status).toBe(304);
+		expect(calls.length).toBe(0);
+	});
+
+	test('教学周不同 → 回源', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:5:1791388800', e: NOW() + 3600 })]] });
+		const calls = installFetch(() => scheduleBody('100:5:1791388800'));
+
+		const res = await edgeCache.fetch(
+			scheduleRequest('/39/2023/1', '?version=100:3:1791388800'),
+			{},
+			{},
+		);
+
+		expect(res.status).toBe(200);
+		expect(calls.length).toBe(1);
+	});
+
+	test('数据版本不同 → 回源（带 version=0），并按响应体刷新 KV', async () => {
+		const kv = installKv({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '99:3:1791388800', e: NOW() + 3600 })]],
+		});
+		const calls = installFetch(() => scheduleBody('100:3:200'));
+
+		const res = await edgeCache.fetch(
+			scheduleRequest('/39/2023/1', '?version=100:3:1791129600'),
+			{},
+			{},
+		);
+
+		expect(res.status).toBe(200);
+		expect(calls.length).toBe(1);
+		// 源站已不用第三段判定：透传客户端版本只会换回没有响应体的 304，学不到新变化点
+		expect(new URL(calls[0]).searchParams.get('version')).toBe('0');
+		// 按响应体的 version 刷新，变化点取版本串第三段
+		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '100:3:200', e: 200 }));
+	});
+
+	test('版本串无法解析 → 一律回源，不猜身份', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() + 3600 })]] });
 		const calls = installFetch(() => scheduleBody('100:3:200'));
 
 		const res = await edgeCache.fetch(scheduleRequest(), {}, {});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
-		// 按响应体的 version 刷新，变化点取版本串第三段
-		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '100:3:200', e: 200 }));
 	});
 
-	test('越过变化点 → 即使版本相同也回源', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: 'v1', e: NOW() - 1 })]] });
-		const calls = installFetch(() => scheduleBody('v1'));
+	test('越过变化点 → 即使数据版本/教学周相同也回源', async () => {
+		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() - 1 })]] });
+		const calls = installFetch(() => scheduleBody('100:3:200'));
 
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=v1'), {}, {});
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:200'), {}, {});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
@@ -178,14 +256,34 @@ describe('读路径', () => {
 		expect(calls.length).toBe(1);
 	});
 
-	test('源站返回 304 时，用客户端版本把 KV 补上', async () => {
-		const kv = installKv({});
+	test('源站回 304 时不改写 KV（不用请求者的私有第三段覆盖共享槽）', async () => {
+		const expired = NOW() - 1;
+		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: expired })]] });
 		installFetch(() => new Response(null, { status: 304 }));
 
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:200'), {}, {});
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:999'), {}, {});
 
 		expect(res.status).toBe(304);
-		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '100:3:200', e: 200 }));
+		expect(res.headers.get('X-Astra-Edge-Schedule')).toBe('revalidated');
+		// 槽里仍是原来那一条：回源带的是 version=0，正常路径下源站不会回 304
+		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '100:3:200', e: expired }));
+	});
+
+	test('旧版本写下的「没有到期时刻」条目（e=0）不再信任，回源一次并补上到期时刻', async () => {
+		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '1772129866:31', e: 0 })]] });
+		const calls = installFetch(() => scheduleBody('1772129866:31:1791388800'));
+
+		const res = await edgeCache.fetch(
+			scheduleRequest('/39/2023/1', '?version=1772129866:31'),
+			{},
+			{},
+		);
+
+		expect(res.status).toBe(200);
+		expect(calls.length).toBe(1);
+		expect(kv.data.get(SCHEDULE_KEY)).toBe(
+			JSON.stringify({ v: '1772129866:31:1791388800', e: 1791388800 }),
+		);
 	});
 
 	test('不带 version 参数不接管（交回源）', async () => {

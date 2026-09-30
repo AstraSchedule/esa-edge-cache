@@ -586,6 +586,20 @@ const SCHEDULE_SOFT_TTL_SECONDS = CACHE_TTL_SECONDS;
 const PURGE_SCOPES_HEADER = 'X-Astra-Purge-Scopes';
 
 /**
+ * 回源请求：把 version 换成 0，强制源站重新计算整周快照。
+ * 构造失败时退回原请求——那样最多拿回一个 304（客户端数据仍然是对的），不影响本次响应。
+ */
+function scheduleOriginRequest(request) {
+	try {
+		const url = new URL(request.url);
+		url.searchParams.set('version', '0');
+		return new Request(url.toString(), request);
+	} catch (e) {
+		return request;
+	}
+}
+
+/**
  * 只接管「客户端课表读取」：GET + 恰好三段路径 + 带 version 查询参数。
  * version 参数是客户端独有的判据——管理端读配置走 /web/config/...，不带该参数。
  * 返回 null 表示不接管，交给调用方回源。
@@ -607,21 +621,33 @@ async function handleSchedule(request, env, context) {
 	const clientVersion = String(url.searchParams.get('version') || '');
 	const cached = await readScheduleCache(store, key);
 
-	// 命中：客户端版本与缓存一致，且还没走到「下一次可能变化」的时刻 → 304
-	if (cached && cached.v === clientVersion && !scheduleExpired(cached.e)) {
+	// 命中判据与源站 304 判据对齐：只比「数据版本 + 教学周」这两件有身份意义的事实。
+	// 版本串第三段是「最后一次生成快照那天 + 7 天」的滑动值（源站 service.VersionBoundary 里
+	// dateOnly(now).AddDate(0, 0, 7)）：每台设备最后一次拿到 200 的日期不同，手上的值就不同。
+	// 拿它做整串比较时，同一个班在边缘（只有一个 KV 槽）只能命中其中一台设备的串，其余全部回源，
+	// 而源站对它们一律答 304 —— 这正是「本该在边缘答 304 的请求抵达源站」的原因。
+	// 第三段只在 e 到点时触发一次回源复核；e <= 0 是旧版本写下的「没有到期时刻」条目，
+	// 无法判断是否还新鲜，同样回源一次，写回带到期时刻的新条目后恢复正常命中。
+	if (
+		cached &&
+		cached.e > 0 &&
+		!scheduleExpired(cached.e) &&
+		sameScheduleIdentity(cached.v, clientVersion)
+	) {
 		return new Response(null, {
 			status: 304,
 			headers: { [SCHEDULE_EDGE_HEADER]: 'hit' },
 		});
 	}
 
-	// 回源：原样透传（version 参数必须带上，源站要按三段解析它）
-	const response = await fetch(request);
+	// 回源带 version=0：源站不再用第三段判定 304，原样透传客户端版本只会换回一个没有响应体的
+	// 304，边缘学不到源站当前的变化点；带 0 强制源站重算整周快照，才能把版本与到期时刻写进 KV。
+	const response = await fetch(scheduleOriginRequest(request));
 
-	// 304：说明客户端带来的版本就是源站当前版本，把它写进 KV，
-	// 否则这次回源白跑、KV 永远填不上（304 没有响应体，只能这样补）
+	// 源站回 304（回源带的是 version=0，正常路径下不会发生：只可能是源站还在用第三段判定，
+	// 或运行时没接受改写后的请求）。无论哪种，**不能**把客户端那串写进 KV——那是拿请求者的私有值
+	// 覆盖共享槽，同一个班的不同第三段互相踩，回源永远不收敛（源站只认数据版本与教学周，不会纠正它们）。
 	if (response.status === 304) {
-		await writeScheduleVersion(store, key, clientVersion);
 		return new Response(null, {
 			status: 304,
 			headers: { [SCHEDULE_EDGE_HEADER]: 'revalidated' },
@@ -786,6 +812,40 @@ export function scheduleBoundaryOf(version) {
 	}
 	const boundary = Number(parts[2]);
 	return Number.isFinite(boundary) && boundary > 0 ? Math.floor(boundary) : 0;
+}
+
+/**
+ * 解析版本串 dataVersion:weekNumber[:变化点]，与源站 parseScheduleVersion 同口径：
+ * 只认前两段，第二段之后（变化点）一律忽略，因此客户端可以不带它；
+ * 只有一段时按旧客户端的纯数据版本处理，week 记 0（与任何 week >= 1 的复合版本都不同）。
+ * 数据版本不是整数、或教学周不是 >= 1 的整数时返回 null，调用方一律按「不同」处理（回源更安全）。
+ */
+export function parseScheduleVersion(version) {
+	const parts = String(version == null ? '' : version).split(':');
+	const dataVersion = versionToNumber(parts[0]);
+	if (dataVersion === null) {
+		return null;
+	}
+	if (parts.length < 2) {
+		return { dataVersion, week: 0 };
+	}
+	const week = versionToNumber(parts[1]);
+	if (week === null || week < 1) {
+		return null;
+	}
+	return { dataVersion, week };
+}
+
+/** 两个版本串的身份部分（数据版本 + 教学周）是否相同；任一侧解析不出来都算不同 */
+export function sameScheduleIdentity(left, right) {
+	const a = parseScheduleVersion(left);
+	const b = parseScheduleVersion(right);
+	return !!a && !!b && a.dataVersion === b.dataVersion && a.week === b.week;
+}
+
+function versionToNumber(part) {
+	const text = String(part == null ? '' : part);
+	return /^[+-]?\d+$/.test(text) ? Number(text) : null;
 }
 
 /**

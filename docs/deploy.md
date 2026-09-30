@@ -123,7 +123,8 @@ curl -sS -D - "https://class.getastra.cn/api/weather/%E5%8C%97%E4%BA%AC"
 curl -sS -D - "https://class.getastra.cn/39/2023/1" -o /dev/null
 
 # 3b) 带 version 的课表读：应 304 + X-Astra-Edge-Schedule: hit
-#     （首次回源后是 revalidated，KV 最终一致，最长 300 秒转 hit）
+#     （首次是 miss：回源带 version=0 拿到 200 写下 KV，之后即 hit；
+#      出现 revalidated 说明源站又用第三段判定 304 了——正常路径不应该走到）
 curl -sS -D - "https://class.getastra.cn/39/2023/1?version=1772129866:30" -o /dev/null
 
 # 4) 不带城市的 /api/weather/：边缘按客户端 IP 定位（ESA request.info 的 ip_city_en），
@@ -169,4 +170,5 @@ aliyun esa DeleteRoutineRoute --region cn-hangzhou \
 | 全部 401 | 打的是预览地址但没带 `esa_er_token`；token 只有 1 小时 |
 | `/api/weather/` 返回 400「无法从客户端 IP 定位城市…」 | 这是**边缘自己**答的：检查 `request.info` 是否有 `ip_city_en`（用预览地址打一次即可看到）|
 | `/api/weather/` 返回源站那句 400「请确保请求经过 Cloudflare」或「未配置天气认证信息：请配置 JWT」 | 说明请求根本没进函数：路由没命中该 host，或直接打到了源站 |
-| 课表读一直是 `revalidated` 而非 `hit` | 边缘 KV 最终一致（最长 300 秒）；再不行看 `ListKvs --Namespace astra --Prefix s1.` 里的版本串与客户端带来的写法是否一字不差 |
+| 课表读一直 `miss`、每次回源 | 边缘 KV 最终一致（最长 300 秒）；再不行看 `ListKvs --Namespace astra --Prefix s1.` 里的条目是否存在、数据版本/教学周是否与客户端带来的串一致（第三段不参与判定，写法差异不会再导致 miss）|
+| 课表读出现 `revalidated` | 源站又回到了「用第三段判定 304」的旧版本（回源带的是 version=0，正常必得 200）：先看源站部署版本 |
