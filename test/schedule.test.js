@@ -234,7 +234,7 @@ describe('读路径', () => {
 		expect(calls.length).toBe(1);
 	});
 
-	test('版本串没有变化点段时写软过期，不写「永不过期」', async () => {
+	test('版本串没有变化点段时存 e=0：不设自造 TTL，过期只由写入失效强制', async () => {
 		const kv = installKv({});
 		installFetch(() => scheduleBody('100:3'));
 
@@ -243,17 +243,16 @@ describe('读路径', () => {
 		expect(first.status).toBe(200);
 		const stored = JSON.parse(kv.data.get(SCHEDULE_KEY));
 		expect(stored.v).toBe('100:3');
-		// 没有变化点 ≠ 永不过期：到期时刻必须有界且非 0
-		expect(stored.e).toBeGreaterThan(NOW());
-		expect(stored.e).toBeLessThanOrEqual(NOW() + 600);
+		// 源站没有变化点段时同样省略第三段（304 长期有效），边缘照存 0，不自造上界
+		expect(stored.e).toBe(0);
 
-		// 软过期未到之前，同一版本仍然命中 304
+		// 同一版本继续命中 304，不回源
 		const second = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
 		expect(second.status).toBe(304);
 		expect(second.headers.get('X-Astra-Edge-Schedule')).toBe('hit');
 	});
 
-	test('软过期到点后回源复核，不再替客户端答 304', async () => {
+	test('到期时刻到点后回源复核，不再替客户端答 304', async () => {
 		const { res, calls } = await scheduleMissCase({
 			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3', e: NOW() - 1 })]],
 			search: '?version=100:3',
@@ -277,18 +276,16 @@ describe('读路径', () => {
 		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '100:3:200', e: expired }));
 	});
 
-	test('旧版本写下的「没有到期时刻」条目（e=0）不再信任，回源一次并补上到期时刻', async () => {
-		const { res, calls, kv } = await scheduleMissCase({
-			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '1772129866:31', e: 0 })]],
-			search: '?version=1772129866:31',
-			originVersion: '1772129866:31:1791388800',
-		});
+	test('e=0 的条目照常命中 304：源站口径下「没有变化点」就是长期有效', async () => {
+		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '1772129866:31', e: 0 })]] });
+		const calls = installFetch(() => new Response('origin', { status: 200 }));
 
-		expect(res.status).toBe(200);
-		expect(calls.length).toBe(1);
-		expect(kv.data.get(SCHEDULE_KEY)).toBe(
-			JSON.stringify({ v: '1772129866:31:1791388800', e: 1791388800 }),
-		);
+		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=1772129866:31'), {}, {});
+
+		expect(res.status).toBe(304);
+		expect(res.headers.get('X-Astra-Edge-Schedule')).toBe('hit');
+		expect(calls.length).toBe(0);
+		expect(kv.data.get(SCHEDULE_KEY)).toBe(JSON.stringify({ v: '1772129866:31', e: 0 }));
 	});
 
 	test('不带 version 参数不接管（交回源）', async () => {

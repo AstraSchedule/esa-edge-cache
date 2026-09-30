@@ -571,17 +571,6 @@ const SCHEDULE_KEY_PREFIX = 's1.';
 const SCHEDULE_EDGE_HEADER = 'X-Astra-Edge-Schedule';
 
 /**
- * 版本串没有变化点段（`dataVersion:week`）时的软过期时长（秒）。
- *
- * 没有变化点只说明「没有已知的未来变化点」，不代表版本串不再变：数据版本会因
- * 任意一次课表写入而推进，教学周每周也会前进。把这种情况当成「永不过期」
- * （存 e=0），边缘就会一直替客户端答 304，客户端永久停在旧课表；源站侧同一
- * 故障见 usr-backend/router/client/version_test.go。
- * 这里改为让它定期回源复核，陈旧窗口有上界；回源只是一次廉价的课表查询。
- */
-const SCHEDULE_SOFT_TTL_SECONDS = CACHE_TTL_SECONDS;
-
-/**
  * 源站用它声明「这次写入让哪些班级的缓存失效」，值是以逗号分隔的 school/grade/class。
  * 缺这个头、或头里没有合法 scope 时，边缘**不报错也不操作**、原样返回——
  * 用户、认证这类接口本来就与课表缓存无关。
@@ -629,11 +618,11 @@ async function handleSchedule(request, env, context) {
 	// dateOnly(now).AddDate(0, 0, 7)）：每台设备最后一次拿到 200 的日期不同，手上的值就不同。
 	// 拿它做整串比较时，同一个班在边缘（只有一个 KV 槽）只能命中其中一台设备的串，其余全部回源，
 	// 而源站对它们一律答 304 —— 这正是「本该在边缘答 304 的请求抵达源站」的原因。
-	// 第三段只在 e 到点时触发一次回源复核；e <= 0 是旧版本写下的「没有到期时刻」条目，
-	// 无法判断是否还新鲜，同样回源一次，写回带到期时刻的新条目后恢复正常命中。
+	// 第三段只在 e 到点时触发一次回源复核；e = 0 表示源站当时没有已知的未来变化点
+	// （源站 scheduleVersion 此时同样省略第三段），按源站口径就是「304 长期有效」，
+	// 边缘不另加自造上界——陈旧窗口只由写入失效（删键）强制关闭。
 	if (
 		cached &&
-		cached.e > 0 &&
 		!scheduleExpired(cached.e) &&
 		sameScheduleIdentity(cached.v, clientVersion)
 	) {
@@ -770,14 +759,19 @@ async function readScheduleCache(store, key) {
 	}
 }
 
-/** 写入版本；写失败只影响下一次能否命中，本次响应照常返回 */
+/**
+ * 写入版本与到期时刻。到期时刻只取源站给的第三段（下一次可能变化时刻）；没有该段就存 0：
+ * 源站 scheduleVersion 同样在没有已知未来变化点时省略第三段，语义是 304 长期有效
+ * （usr-backend/router/client/getSchedule.go:186-197），边缘不另加上界。
+ * 陈旧窗口由写入操作强制关闭：源站写入响应带 X-Astra-Purge-Scopes，handleMutating 删键后
+ * 下一次读回源即拿到新的数据版本。写失败只影响下一次能否命中，本次响应照常返回。
+ */
 async function writeScheduleVersion(store, key, version) {
 	const normalized = String(version || '');
 	if (!normalized) {
 		return;
 	}
-	const boundary = scheduleBoundaryOf(normalized);
-	const expiresAt = boundary > 0 ? boundary : nowSeconds() + SCHEDULE_SOFT_TTL_SECONDS;
+	const expiresAt = scheduleBoundaryOf(normalized);
 	try {
 		await store.put(
 			key,
@@ -804,9 +798,9 @@ export function versionOfScheduleBody(text) {
 
 /**
  * 版本串第三段是「下一次可能变化时刻」（Unix 秒），源站 scheduleVersion 生成；
- * 没有该段说明当前没有已知的未来变化点，返回 0。
- * 注意：0 只代表「没有已知变化点」，不代表版本串不会再变 —— 写 KV 时不会存 0，
- * 而是存 SCHEDULE_SOFT_TTL_SECONDS 之后的软过期时刻。
+ * 没有该段说明当前没有已知的未来变化点，返回 0，原样写进 KV。
+ * 0 只代表「没有已知变化点」，不代表版本串不会再变；但源站在这种情况下同样省略第三段、
+ * 由写入推进 dataVersion 兜底，所以边缘不另加自造上界，陈旧窗口交给写入失效删键。
  */
 export function scheduleBoundaryOf(version) {
 	const parts = String(version || '').split(':');
@@ -852,8 +846,9 @@ function versionToNumber(part) {
 }
 
 /**
- * 越过存下来的过期时刻就必须回源：即使版本串没变，命中结果也可能已经不同了。
- * 到期时刻要么是变化点，要么是没有变化点时的软过期时刻（都 > 0）。
+ * 越过存下来的到期时刻就必须回源：即使版本串没变，命中结果也可能已经不同了。
+ * 到期时刻就是源站给的第三段变化点（> 0）；e = 0 表示当时没有已知的未来变化点，
+ * 永不到点——过期只能由写入失效（X-Astra-Purge-Scopes 触发的删键）强制。
  */
 function scheduleExpired(boundary) {
 	return boundary > 0 && nowSeconds() >= boundary;
