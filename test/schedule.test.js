@@ -132,20 +132,36 @@ describe('路径与键', () => {
 	});
 });
 
+/** 命中用例的公共摆设法：种一条 KV，并让「回源」必然失败——真回源了就说明没命中 */
+async function scheduleHitCase({ seedVersion, requestVersion }) {
+	const kv = installKv({
+		seed: [[SCHEDULE_KEY, JSON.stringify({ v: seedVersion, e: NOW() + 3600 })]],
+	});
+	const calls = installFetch(() => new Response('should not happen', { status: 500 }));
+	const res = await edgeCache.fetch(
+		scheduleRequest('/39/2023/1', `?version=${encodeURIComponent(requestVersion)}`),
+		{},
+		{},
+	);
+	return { res, calls, kv };
+}
+
+/** 回源用例的公共摆设法：种一条 KV（可注入失败模式），源站按 originVersion 回 200 */
+async function scheduleMissCase({ seed, search, originVersion = '100:3:200', kvOptions = {} }) {
+	const kv = installKv({ ...kvOptions, seed });
+	const calls = installFetch(() => scheduleBody(originVersion));
+	const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', search), {}, {});
+	return { res, calls, kv };
+}
+
 describe('读路径', () => {
 	test('同数据版本/教学周、第三段不同但未到变化点 → 304，不回源', async () => {
 		// 线上故障的核心用例：同一个班的多台设备各带自己那天生成的第三段，
 		// 源站只会答 304，边缘必须也能就地答 304，不能再回源
-		const kv = installKv({
-			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:1791388800', e: NOW() + 3600 })]],
+		const { res, calls, kv } = await scheduleHitCase({
+			seedVersion: '100:3:1791388800',
+			requestVersion: '100:3:1791129600',
 		});
-		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
-
-		const res = await edgeCache.fetch(
-			scheduleRequest('/39/2023/1', '?version=100:3:1791129600'),
-			{},
-			{},
-		);
 
 		expect(res.status).toBe(304);
 		expect(res.headers.get('X-Astra-Edge-Schedule')).toBe('hit');
@@ -154,50 +170,41 @@ describe('读路径', () => {
 	});
 
 	test('版本串完全相同也命中 304', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() + 3600 })]] });
-		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
-
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:200'), {}, {});
+		const { res, calls } = await scheduleHitCase({
+			seedVersion: '100:3:200',
+			requestVersion: '100:3:200',
+		});
 
 		expect(res.status).toBe(304);
 		expect(calls.length).toBe(0);
 	});
 
 	test('客户端不带第三段（纯 dataVersion:week）同样命中', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:1791388800', e: NOW() + 3600 })]] });
-		const calls = installFetch(() => new Response('should not happen', { status: 500 }));
-
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
+		const { res, calls } = await scheduleHitCase({
+			seedVersion: '100:3:1791388800',
+			requestVersion: '100:3',
+		});
 
 		expect(res.status).toBe(304);
 		expect(calls.length).toBe(0);
 	});
 
 	test('教学周不同 → 回源', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:5:1791388800', e: NOW() + 3600 })]] });
-		const calls = installFetch(() => scheduleBody('100:5:1791388800'));
-
-		const res = await edgeCache.fetch(
-			scheduleRequest('/39/2023/1', '?version=100:3:1791388800'),
-			{},
-			{},
-		);
+		const { res, calls } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:5:1791388800', e: NOW() + 3600 })]],
+			search: '?version=100:3:1791388800',
+			originVersion: '100:5:1791388800',
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
 	});
 
 	test('数据版本不同 → 回源（带 version=0），并按响应体刷新 KV', async () => {
-		const kv = installKv({
+		const { res, calls, kv } = await scheduleMissCase({
 			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '99:3:1791388800', e: NOW() + 3600 })]],
+			search: '?version=100:3:1791129600',
 		});
-		const calls = installFetch(() => scheduleBody('100:3:200'));
-
-		const res = await edgeCache.fetch(
-			scheduleRequest('/39/2023/1', '?version=100:3:1791129600'),
-			{},
-			{},
-		);
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
@@ -208,20 +215,20 @@ describe('读路径', () => {
 	});
 
 	test('版本串无法解析 → 一律回源，不猜身份', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() + 3600 })]] });
-		const calls = installFetch(() => scheduleBody('100:3:200'));
-
-		const res = await edgeCache.fetch(scheduleRequest(), {}, {});
+		const { res, calls } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() + 3600 })]],
+			search: '?version=v1',
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
 	});
 
 	test('越过变化点 → 即使数据版本/教学周相同也回源', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() - 1 })]] });
-		const calls = installFetch(() => scheduleBody('100:3:200'));
-
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3:200'), {}, {});
+		const { res, calls } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3:200', e: NOW() - 1 })]],
+			search: '?version=100:3:200',
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
@@ -247,10 +254,11 @@ describe('读路径', () => {
 	});
 
 	test('软过期到点后回源复核，不再替客户端答 304', async () => {
-		installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3', e: NOW() - 1 })]] });
-		const calls = installFetch(() => scheduleBody('100:3'));
-
-		const res = await edgeCache.fetch(scheduleRequest('/39/2023/1', '?version=100:3'), {}, {});
+		const { res, calls } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '100:3', e: NOW() - 1 })]],
+			search: '?version=100:3',
+			originVersion: '100:3',
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
@@ -270,14 +278,11 @@ describe('读路径', () => {
 	});
 
 	test('旧版本写下的「没有到期时刻」条目（e=0）不再信任，回源一次并补上到期时刻', async () => {
-		const kv = installKv({ seed: [[SCHEDULE_KEY, JSON.stringify({ v: '1772129866:31', e: 0 })]] });
-		const calls = installFetch(() => scheduleBody('1772129866:31:1791388800'));
-
-		const res = await edgeCache.fetch(
-			scheduleRequest('/39/2023/1', '?version=1772129866:31'),
-			{},
-			{},
-		);
+		const { res, calls, kv } = await scheduleMissCase({
+			seed: [[SCHEDULE_KEY, JSON.stringify({ v: '1772129866:31', e: 0 })]],
+			search: '?version=1772129866:31',
+			originVersion: '1772129866:31:1791388800',
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);
@@ -297,10 +302,10 @@ describe('读路径', () => {
 	});
 
 	test('KV 抛异常时仍正常回源', async () => {
-		installKv({ failGet: true });
-		const calls = installFetch(() => scheduleBody('100:3:200'));
-
-		const res = await edgeCache.fetch(scheduleRequest(), {}, {});
+		const { res, calls } = await scheduleMissCase({
+			search: '?version=v1',
+			kvOptions: { failGet: true },
+		});
 
 		expect(res.status).toBe(200);
 		expect(calls.length).toBe(1);

@@ -128,6 +128,9 @@ async function handleWeather(request, env, context) {
 	try {
 		return await serveWeather(request, query, env, context);
 	} catch (e) {
+		// 源站 stats.go 的 recordWeatherError 只统计源站侧的上游失败，边缘这边的失败
+		// 观测不到，所以必须留下日志（docs/design.md：观测口径需要用边缘日志补齐）
+		console.error('weather edge error', e && e.message);
 		// 边缘自己出错也不回源：给客户端一个源站同形的 502，让它按原有逻辑重试
 		return weatherError(502, BODY_UPSTREAM_ERROR);
 	}
