@@ -209,9 +209,15 @@ issue #63 的主体是「客户端带着本地 `version` 回来时直接在边�
 `X-Astra-Purge-Scopes`，边缘在 `handleMutating` 里删掉对应键，下一次读回源即拿到新的数据版本与
 新的到期时刻。命中不要求到期时刻 `> 0`：`e = 0` 表示当时没有已知的未来变化点，照常命中。
 
-第二条强制通道在客户端侧：手动「更新课表」（渲染进程按钮与托盘菜单）与 WS `SyncConfig` 都带
-`version=0`，`0` 与任何真实版本串的身份都不相等，**一定 miss → 回源 200 → 就地刷新 KV**，
-不依赖写入失效（单测：`test/schedule.test.js` 的 `version=0 一律回源并刷新 KV`）。
+第二条强制通道在客户端侧：**时间驱动的日程状态变化**（`js/renderer.js` 的每秒 tick，进入下一个
+日程时发 `getScheduleFromCloud` IPC）会让 `desktop/main.js` 的处理器先把 `currentVersionToken` 归零，
+于是该次请求带 `version=0`；`0` 与任何真实版本串的身份都不相等，**一定 miss → 回源 200 → 就地刷新 KV**，
+不依赖写入失效（单测：`test/schedule.test.js` 的 `version=0 一律回源并刷新 KV`）。冷启动时本地版本索引
+取不到可复用串（`main/scheduleVersion.js` 的 `pickReusableVersion` 返回 null）同样以 `version=0` 首发。
+
+**已知取舍**：部署版客户端的托盘菜单「更新课表」与 WS `SyncConfig` 直接调 `getScheduleFromCloud()`，
+**不带** `version=0`（沿用本地令牌）——这两条路径会先走边缘判定，遇到陈旧条目时可能仍显示旧课表，
+要等日程状态变化触发上面那条通道、或写入失效删键才被纠正。
 
 ### 8.3 已知风险
 
