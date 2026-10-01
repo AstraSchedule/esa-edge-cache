@@ -3,7 +3,7 @@
 星程课表（AstraSchedule）SaaS 版的 **ESA 边缘函数**。
 
 - 对应 issue：[AstraSchedule/desktop#63 基于 KV 存储的进一步压缩响应时间与部署成本的方法](https://github.com/AstraSchedule/desktop/issues/63)
-- **当前内容：边缘天气 + 课表版本缓存**（issue #63 的两半）
+- **当前内容：边缘天气 + 课表版本缓存**（issue #63 的两半）+ 最低兼容客户端版本闸门
 - 课表版本缓存原因 desktop#57「更好的自动任务」会改版本串语义而暂缓；#57 已落地，2026-09-27 补上
 
 只服务 SaaS 部署（`class.` / `njx.` / `kuohu.` / `sandbox.getastra.cn` → FC）。
@@ -88,6 +88,9 @@
   「非 GET/OPTIONS」「UA 含 AstraSchedule」三类课表读写；根路径由单独的 `edge-root-probe` 规则
   接管（单条规则的嵌套层级受套餐配额限制，并进 `edge-weather-class` 会报
   `NestedRuleQuotaCheckFailed`）。其余请求照旧回源——既不改变别的接口，也省函数配额。
+- **最低兼容客户端版本闸门**：函数最先判 UA 里的客户端版本，低于函数变量 `MIN_CLIENT_VERSION` 的旧客户端
+  不论方法、路径、`version` 参数一律 **426 且不回源**（非 `AstraSchedule` 的 UA 视为兼容放行）；
+  变相逼旧客户端走自动更新，同时挡住更新完成前它产生的脏数据（`handleMinClientVersion`，见 design.md 3.3）。
 - **环境变量键名只能是字母数字下划线**；主机名校验不通过或 API Key 为空时边缘回 403，
   不再回源（未配置变量的部署也不会把流量打到 FC）。
 

@@ -573,3 +573,135 @@ describe('根路径连通性探针', () => {
 		expect(out.origin).toHaveLength(1);
 	});
 });
+
+describe('最低兼容客户端版本闸门', () => {
+	const MIN = '202610.1.0';
+	const SCHEDULE = '/39/2023/1?version=0';
+	const withMin = (min) => ({ ...ENV, MIN_CLIENT_VERSION: min });
+	/** UA 是客户端唯一的版本载体；不传 ua 表示不带 user-agent 头 */
+	const uaRequest = (ua, path = SCHEDULE, init = {}) =>
+		request(path, ua === undefined ? init : { ...init, headers: { 'user-agent': ua } });
+
+	test('未配置 MIN_CLIENT_VERSION 时闸门关闭，旧客户端照常回源', async () => {
+		const response = await edgeWeather.fetch(uaRequest('AstraSchedule/1.6.1'), {}, ENV);
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('低于阈值的客户端一律 426，不落任何处理器、不回源', async () => {
+		const response = await edgeWeather.fetch(
+			uaRequest('AstraSchedule/202609.28.150'),
+			{}, withMin(MIN),
+		);
+
+		expect(response.status).toBe(426);
+		expect(response.headers.get('X-Astra-Edge-Min-Version')).toBe('block');
+		expect(response.headers.get('X-Astra-Min-Client-Version')).toBe(MIN);
+		expect(response.headers.get('Cache-Control')).toBe('no-store');
+		expect(response.headers.get('Content-Type')).toBe('application/json; charset=utf-8');
+		expect(await response.json()).toEqual({
+			error: '客户端版本过低，已停止提供数据：请更新到 ' + MIN + ' 或更高版本',
+			min_version: MIN,
+		});
+		expect(out.origin).toHaveLength(0);
+		expect(out.upstream).toHaveLength(0);
+		expect(kv.data.size).toBe(0);
+	});
+
+	test('版本等于阈值即放行（判据是 >=，不是 >）', async () => {
+		const response = await edgeWeather.fetch(uaRequest('AstraSchedule/' + MIN), {}, withMin(MIN));
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('按段数值比较，不是字符串字典序', async () => {
+		// 202609.28.150 > 202609.5.1：按字典序会判成「更小」而被误拦
+		const response = await edgeWeather.fetch(
+			uaRequest('AstraSchedule/202609.28.150'),
+			{}, withMin('202609.5.1'),
+		);
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('非客户端 UA（浏览器、脚本、扫描器）视为兼容放行', async () => {
+		const agents = [
+			'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+			'curl/8.4.0',
+			'python-requests/2.33.0',
+			'VirusTotal',
+		];
+		for (const ua of agents) {
+			out.origin.length = 0;
+			const response = await edgeWeather.fetch(uaRequest(ua), {}, withMin(MIN));
+
+			expect([ua, response.status]).toEqual([ua, 200]);
+			expect(out.origin).toHaveLength(1);
+		}
+	});
+
+	test('只有 AstraSchedule 没有版本号 → 按 0 处理，低于阈值即拦', async () => {
+		const response = await edgeWeather.fetch(uaRequest('AstraSchedule'), {}, withMin(MIN));
+
+		expect(response.status).toBe(426);
+		expect(response.headers.get('X-Astra-Edge-Min-Version')).toBe('block');
+	});
+
+	test('不带 user-agent 的请求视为非客户端，放行', async () => {
+		const response = await edgeWeather.fetch(uaRequest(undefined), {}, withMin(MIN));
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(1);
+	});
+
+	test('阈值不是点分纯数字（配置笔误）→ 闸门关闭，不误伤全量客户端', async () => {
+		for (const min of ['', 'latest', '202610.1.beta']) {
+			out.origin.length = 0;
+			const response = await edgeWeather.fetch(uaRequest('AstraSchedule/1.6.1'), {}, withMin(min));
+
+			expect([min, response.status]).toEqual([min, 200]);
+			expect(out.origin).toHaveLength(1);
+		}
+	});
+
+	test('命中闸门时不论方法、路径与 version 参数，一律 426 且不回源', async () => {
+		const cases = [
+			['GET / 连通性探针', uaRequest('AstraSchedule/1.6.1', '/')],
+			['POST / 连通性探针', uaRequest('AstraSchedule/1.6.1', '/', { method: 'POST', body: '{}' })],
+			['PUT 写请求', uaRequest('AstraSchedule/1.6.1', '/web/config/2023', { method: 'PUT', body: '{}' })],
+			['天气接口', uaRequest('AstraSchedule/1.6.1', weatherPath)],
+			['课表接口（带 version）', uaRequest('AstraSchedule/1.6.1')],
+		];
+		for (const [label, req] of cases) {
+			out.origin.length = 0;
+			out.upstream.length = 0;
+			const response = await edgeWeather.fetch(req, {}, withMin(MIN));
+
+			expect([label, response.status]).toEqual([label, 426]);
+			expect(out.origin).toHaveLength(0);
+			expect(out.upstream).toHaveLength(0);
+			expect(kv.data.size).toBe(0);
+		}
+	});
+
+	test('HEAD 命中闸门时同样 426，但不带响应体', async () => {
+		const response = await edgeWeather.fetch(
+			uaRequest('AstraSchedule/1.6.1', '/', { method: 'HEAD' }),
+			{}, withMin(MIN),
+		);
+
+		expect(response.status).toBe(426);
+		expect(await response.text()).toBe('');
+	});
+
+	test('版本达标时不干扰原流程：课表请求仍按缓存未命中回源（version 被改写成 0）', async () => {
+		const response = await edgeWeather.fetch(uaRequest('AstraSchedule/' + MIN), {}, withMin(MIN));
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(1);
+		expect(out.origin[0].url).toContain('version=0');
+	});
+});

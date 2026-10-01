@@ -64,6 +64,16 @@ aliyun esa-cli env list --environment production -n esa-edge-cache
 变量名只能字母、数字、下划线。读不到变量时函数回 403（不再回源），表现为「部署成功但天气
 报未配置认证信息」，排查时先看这里。
 
+可选变量 `MIN_CLIENT_VERSION`（最低兼容客户端版本，明文即可；语义见 `docs/design.md` 3.3）：
+
+```bash
+# 低于该版本的客户端一律 426；留空或不设 = 闸门关闭（配成非点分纯数字也会自动关闭）
+aliyun esa-cli env set "MIN_CLIENT_VERSION=202610.1.0" --environment production -n esa-edge-cache
+aliyun esa-cli deploy --environment production
+```
+
+**在「携带版本号」的客户端构建确认发布之后再设这个值**：阈值一旦高于在跑的最低版本，那部分用户会
+立刻在边缘被拦（只显示本地缓存），直到客户端自动更新完成。
 ## 4. 挂函数路由：用「路由」，**不要**用「域名绑定」
 
 这是最容易做错的地方。
@@ -162,6 +172,14 @@ curl -sS -D - -A "AstraSchedule/1.6.1" "https://class.getastra.cn/"
 curl -sS -D - -A "AstraSchedule/1.6.1" "https://class.getastra.cn/?probe=1"
 # POST 也必须在边缘结束（源站 gin 的默认 404），不能出现 x-fc-request-id
 curl -sS -D - -X POST --data '{}' -A "AstraSchedule/1.6.1" "https://class.getastra.cn/"
+
+# 7) 最低兼容客户端版本闸门（需先设 MIN_CLIENT_VERSION 并重新部署）
+#    低于阈值：426 + X-Astra-Edge-Min-Version: block，且不能出现 x-fc-request-id
+curl -sS -D - -A "AstraSchedule/1.6.1" "https://class.getastra.cn/"
+#    等于/高于阈值：正常放行（阈值本身即通过）
+curl -sS -D - -A "AstraSchedule/202610.1.0" "https://class.getastra.cn/"
+#    非客户端 UA（浏览器/脚本）：放行
+curl -sS -D - -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" "https://class.getastra.cn/"
 ```
 
 上线当天实测结果：
