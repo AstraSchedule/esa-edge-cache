@@ -419,8 +419,8 @@ describe('失败处理与旁路', () => {
 		expect(kv.namespaces.every((n) => n === 'astra')).toBe(true);
 	});
 
-	test('非天气路径与非 GET 方法一律透传', async () => {
-		const paths = ['/', '/39/2023/1', '/api/weather/a/b/c', '/api/weather/a/b/c/d', '/web/config/2023'];
+	test('非天气非根路径与非 GET 方法一律透传', async () => {
+		const paths = ['/39/2023/1', '/api/weather/a/b/c', '/api/weather/a/b/c/d', '/web/config/2023'];
 		for (const path of paths) {
 			out.origin.length = 0;
 			await edgeWeather.fetch(request(path), {}, ENV);
@@ -515,5 +515,61 @@ describe('响应体组装', () => {
 			]),
 		);
 		expect(body.warn).toBe('ok');
+	});
+});
+
+describe('根路径连通性探针', () => {
+	test('GET / 由边缘作答，不回源', async () => {
+		const response = await edgeWeather.fetch(request('/'), {}, ENV);
+
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ message: 'Hello World' });
+		expect(response.headers.get('Content-Type')).toBe('application/json; charset=utf-8');
+		expect(response.headers.get('X-Astra-Edge-Root')).toBe('hit');
+		expect(out.origin).toHaveLength(0);
+		expect(out.upstream).toHaveLength(0);
+		expect(kv.data.size).toBe(0);
+	});
+
+	test('HEAD / 同样由边缘作答，且不返回响应体', async () => {
+		const response = await edgeWeather.fetch(request('/', { method: 'HEAD' }), {}, ENV);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('');
+		expect(response.headers.get('X-Astra-Edge-Root')).toBe('hit');
+		expect(out.origin).toHaveLength(0);
+	});
+
+	test('带查询串的 / 也算探针', async () => {
+		const response = await edgeWeather.fetch(request('/?probe=1'), {}, ENV);
+
+		expect(response.status).toBe(200);
+		expect(out.origin).toHaveLength(0);
+	});
+
+	test('POST / 也在边缘作答，不回源（源站是 gin 的 404）', async () => {
+		const response = await edgeWeather.fetch(request('/', { method: 'POST', body: '{}' }), {}, ENV);
+
+		expect(response.status).toBe(404);
+		expect(await response.text()).toBe('404 page not found');
+		expect(response.headers.get('Content-Type')).toBe('text/plain');
+		expect(response.headers.get('X-Astra-Edge-Root')).toBe('hit');
+		expect(out.origin).toHaveLength(0);
+		expect(out.upstream).toHaveLength(0);
+	});
+
+	test('OPTIONS / 回 204 空体，同样不回源', async () => {
+		const response = await edgeWeather.fetch(request('/', { method: 'OPTIONS' }), {}, ENV);
+
+		expect(response.status).toBe(204);
+		expect(await response.text()).toBe('');
+		expect(response.headers.get('X-Astra-Edge-Root')).toBe('hit');
+		expect(out.origin).toHaveLength(0);
+	});
+
+	test('非根路径不受影响，仍回源', async () => {
+		await edgeWeather.fetch(request('/web/config/2023'), {}, ENV);
+
+		expect(out.origin).toHaveLength(1);
 	});
 });

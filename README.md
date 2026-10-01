@@ -67,7 +67,8 @@
 | KV | `s1.Y2xhc3MuZ2V0YXN0cmEuY24.Mzk.MjAyMw.MQ`（class.getastra.cn / 39 / 2023 / 1）|
 
 路由复用现有那条 `edge-weather-class`：它的规则已包含「带 version 查询参数」「非 GET/OPTIONS」
-与「UA 含 AstraSchedule」，正好覆盖课表读取与写入失效，无需新增规则。
+与「UA 含 AstraSchedule」，正好覆盖课表读取与写入失效，无需新增规则（根路径探针另有一条
+`edge-root-probe`，见下）。
 
 ## 天气设计摘要
 
@@ -79,9 +80,14 @@
   带城市的按 URL 里的城市查；不带城市的按 ESA 运行时 `request.info` 里由客户端 IP
   定位到的 `ip_city_en` 查（原来这条路径靠 Cloudflare 注入的 `CF-IPCity`，
   站点迁到 ESA 之后换成 `request.info`）。写请求、其他接口一律透传。
-- **路由按路径收窄**：函数路由只匹配 `/api/weather/` 前缀，外加「带 `version` 查询参数」
-  「非 GET/OPTIONS」「UA 含 AstraSchedule」三类课表读写（同一条 `edge-weather-class` 规则），
-  其余请求照旧回源——既不改变别的接口，也省函数配额。
+- **`/` 全部由边缘作答**：连通性探针（源站根路由是 gin 的 Hello World）。`GET` 回
+  200 + `{"message":"Hello World"}`，`HEAD` 200 空体，`OPTIONS` 204，其余方法 404
+  `404 page not found`（镜像源站 gin 的默认 404），一律带 `X-Astra-Edge-Root: hit` 且
+  **任何方法都不回源**——免得为一句「网络通不通」拉起 FC 实例（`handleRoot`，见 design.md 3.2）。
+- **路由按路径收窄**：`edge-weather-class` 匹配 `/api/weather/` 前缀，外加「带 `version` 查询参数」
+  「非 GET/OPTIONS」「UA 含 AstraSchedule」三类课表读写；根路径由单独的 `edge-root-probe` 规则
+  接管（单条规则的嵌套层级受套餐配额限制，并进 `edge-weather-class` 会报
+  `NestedRuleQuotaCheckFailed`）。其余请求照旧回源——既不改变别的接口，也省函数配额。
 - **环境变量键名只能是字母数字下划线**；主机名校验不通过或 API Key 为空时边缘回 403，
   不再回源（未配置变量的部署也不会把流量打到 FC）。
 

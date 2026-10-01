@@ -7,8 +7,9 @@
  * 源站函数完全不参与这条路径。
  *
  * 设计要点（取舍与实测见 docs/design.md）：
- *  1. 只接管 `GET /api/weather/<城市>[/<省份>]` 与 `GET /api/weather/`；其余请求一律
- *     `fetch(request)` 透传，本函数不改变任何其他接口的行为。
+ *  1. 只接管 `GET /api/weather/<城市>[/<省份>]`、`GET /api/weather/`、连通性探针
+ *     `GET|HEAD /`（见 handleRoot）与后半段的课表版本读写；其余请求一律 `fetch(request)`
+ *     透传，本函数不改变任何其他接口的行为。
  *  2. 缓存整个响应体，TTL 10 分钟——与源站 `cache.CachePage(10*time.Minute)` 一致。
  *     和风天气按次计费且有免费额度，边缘必须挡在它前面。
  *  3. **天气一旦被本函数认出，就绝不回源**：函数变量没配、和风天气报错、响应格式不认识、
@@ -37,6 +38,19 @@ const ENV_API_KEY = 'QW_API_KEY';
 
 /** 标记本响应是否由边缘产出，用于线上验证与排障：hit（命中缓存）/ miss（边缘现取）/ error（边缘就地判定的失败） */
 const EDGE_HEADER = 'X-Astra-Edge-Weather';
+
+/** 标记根路径连通性探针由边缘作答（见 handleRoot），线上验证与排障用 */
+const ROOT_EDGE_HEADER = 'X-Astra-Edge-Root';
+
+/**
+ * 根路径 `/` 的响应体，与源站 gin 根路由逐字同形
+ * （usr-backend/main.go、sys-backend/router/setup.go 的 `c.JSON(200, gin.H{"message": "Hello World"})`）。
+ * 连通性探测只看「通不通」，保持同形即可，客户端与监控都不用改。
+ */
+const BODY_ROOT = JSON.stringify({ message: 'Hello World' });
+
+/** 源站 gin 对未注册方法/路径的默认 404 体（实测 18 字节，见 docs/design.md 3.2） */
+const BODY_ROOT_NOT_FOUND = '404 page not found';
 
 /**
  * 失败时返回的响应体。状态码与 JSON 键与源站逐个对齐
@@ -78,6 +92,12 @@ export default {
 	async fetch(request, context, env) {
 		const method = String(request.method || 'GET').toUpperCase();
 
+		// 连通性探针 `/`：任何方法都在边缘作答，绝不回源（写请求的 KV 失效逻辑也轮不到它）
+		const root = handleRoot(request, method);
+		if (root) {
+			return root;
+		}
+
 		// 写请求：透传后按源站声明的失效范围清理课表版本缓存（不改变响应）
 		if (method !== 'GET' && method !== 'HEAD') {
 			try {
@@ -108,6 +128,44 @@ export default {
 		return fetch(request);
 	},
 };
+
+/**
+ * 根路径 `/`：源站只注册了 GET（usr-backend/main.go、sys-backend/router/setup.go），
+ * 而实际打过来的几乎都是客户端/监控的连通性探测——启动时确认网络通不通，本身不承载业务。
+ * 这类请求在边缘就能回答，没必要为一个 Hello World 拉起源站的 FC 实例（冷启动几百毫秒起）。
+ *
+ * 路径恰好是 `/` 就接管，**不看方法**：路由规则本身已经把 uri == "/" 的请求（含 POST/OPTIONS）
+ * 全量送进函数，走到这里再放回源站等于白拉一次 FC，且写请求还会顺带触发一遍 KV 失效逻辑。
+ * 非 `/` 一律返回 null，交回 fetch 里的原流程。
+ *
+ * 各方法的响应与线上实测的源站行为逐字同形（docs/design.md 3.2 有实测表）：
+ * GET → 200 Hello World；HEAD → 200 空体；OPTIONS → 204 空体（源站 CORS 预检）；
+ * 其余方法源站没有路由，gin 回 404 text/plain 的「404 page not found」。
+ */
+function handleRoot(request, method) {
+	if (new URL(request.url).pathname !== '/') {
+		return null;
+	}
+	if (method === 'GET' || method === 'HEAD') {
+		return new Response(method === 'HEAD' ? null : BODY_ROOT, {
+			status: 200,
+			headers: {
+				'Content-Type': 'application/json; charset=utf-8',
+				[ROOT_EDGE_HEADER]: 'hit',
+			},
+		});
+	}
+	if (method === 'OPTIONS') {
+		return new Response(null, { status: 204, headers: { [ROOT_EDGE_HEADER]: 'hit' } });
+	}
+	return new Response(BODY_ROOT_NOT_FOUND, {
+		status: 404,
+		headers: {
+			'Content-Type': 'text/plain',
+			[ROOT_EDGE_HEADER]: 'hit',
+		},
+	});
+}
 
 /**
  * 只负责天气这一条路径；返回 null 表示「这不是天气请求，交给调用方回源」。

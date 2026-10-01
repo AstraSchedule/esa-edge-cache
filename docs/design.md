@@ -8,10 +8,11 @@ SaaS 版客户端每次启动/进入下一个日程都会拉一次天气。这�
 
 本仓库把「取天气」搬到边缘：边缘自己查和风天气、自己缓存，**FC 完全不参与这条路径**。
 
-本仓库接管两类请求：
+本仓库接管三类请求：
 
 - 天气：`GET /api/weather/<城市>[/<省份>]` 与不带城市的 `GET /api/weather/`（第 3～5 节）；
-- 课表版本：`GET /<学校>/<年级>/<班级>?version=<版本串>`（第 8 节）。
+- 课表版本：`GET /<学校>/<年级>/<班级>?version=<版本串>`（第 8 节）；
+- 连通性探针：`/`（第 3.2 节，任何方法都在边缘作答、只回与源站同形的响应，不拉 FC 实例）。
 
 其余请求（非 GET、路径不匹配、课表请求不带 `version` 参数）一律 `fetch(request)` 透传。
 
@@ -86,6 +87,65 @@ ESA 的等价物是运行时的 `request.info`，实测形态：
 少一个参数少一种失败模式。
 
 定位不到城市（`request.info` 缺失，或只有国家没有城市）→ 边缘回 400，不回源。
+
+### 3.2 根路径 `/`：连通性探针不进 FC
+
+客户端与监控常打 `GET /` 只为确认「网络通不通」，源站对它的响应是 gin 根路由的
+`c.JSON(200, gin.H{"message": "Hello World"})`（`usr-backend/main.go`、
+`sys-backend/router/setup.go`）。这条请求不承载业务，却会把 FC 实例拉起来（冷启动几百毫秒起），
+也让「FC 层是否可用」的观测被连通性噪声污染。
+
+接管规则（判定只看 `new URL(request.url).pathname` 是否恰好是 `/`，**不看方法**）：
+
+- `GET /` → 200 + `{"message":"Hello World"}` + `Content-Type: application/json; charset=utf-8`，
+  与源站根路由逐字同形；`HEAD /` → 200 空体；`OPTIONS /` → 204 空体。
+- 其余方法（`POST`/`PUT`/`DELETE` …）→ 404 + `Content-Type: text/plain` + `404 page not found`
+  （18 字节），即源站 gin 对未注册方法的默认 404。
+- 以上所有分支都带标记头 `X-Astra-Edge-Root: hit`（值只会是 `hit`），且**都不回源**。
+- 带查询串的 `/`（如 `/?probe=1`）同样接管；只有非 `/` 的路径返回 `null` 交回原流程。
+
+为什么连 `POST /` 也不放回源：路由规则本身把 `http.request.uri.path == "/"` 的请求全量送进函数，
+再放回去等于白拉一次 FC；而且写请求会先经过 `handleMutating`，等于为一句探针顺带跑一遍 KV 失效。
+各方法的响应按**实测到的源站行为**镜像：源站只注册了 `GET /`，gin 按方法建路由树，`HEAD /` 与
+`POST`/`PUT`/`DELETE /` 实际是 404（`text/plain`，18 字节），`OPTIONS /` 由 CORS 中间件回 204。
+边缘对 `HEAD` 按「通」答 200 空体（探测只关心可达性），其余方法原样镜像状态码与体——于是
+`/` 上**没有任何一个方法**会再拉起 FC 实例。
+
+这条路径上还有两层会先于函数结束请求，实测：站点 WAF 的「非标 UA 挑战」对 API 主机上的
+非第一方 UA 直接在边缘作答（`X-Tengine-Error: denied by http_custom`，没有 fc 头）；Pages 托管的
+域名（`i.`/`www.`/`dev.`/`go.`/裸域）被路由规则的 host 黑名单排除，`/` 由 Pages 命中。函数这一层
+兜住的是带着第一方 UA 打到 API 主机的探针（桌面端、监控）。
+
+对应 ESA 路由是**独立一条**（ConfigId `522037019918336`，RouteName `edge-root-probe`，
+Sequence 2，`RouteEnable on`）：
+
+```
+not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri.path == "/"
+```
+
+> 字段选择：用 `http.request.uri.path`（只含路径）而不是 `http.request.uri`（阿里云文档口径为「路径 + 查询串」）。2026-10-01 实测 `http.request.uri == "/"` 在 ESA 函数路由里也能匹配 `/?probe=1`（`sys.`/`to.` 上带 `AstraSchedule` UA 仍回 `X-Astra-Edge-Root: hit`，而这两个域名被天气那条规则整体排除，POST `/web/auth/login` 又确实仍到 FC，说明函数只能从本路由进来），但既然文档把 `.path` 定义为纯路径，就用 `.path` 明示意图，不依赖等值比较的实现细节。
+
+这条的黑名单比天气那条少两个（少了 `sys.getastra.cn` 与 `to.getastra.cn`）：天气那条含「非
+GET/OPTIONS → 进函数」的子句，必须把这两个纯 API 域名排除掉，否则会劫持它们的写请求；根路径
+规则只匹配 `/`，不存在这个问题。于是 API 域名（`class.`/`sys.`/`to.`/`njx.`/`sandbox.`/`kuohu.`）的
+`/` 全部由边缘作答，只有 Pages 托管的五个域名继续交给 Pages。
+
+**为什么不并进天气那条规则**：单条规则的嵌套层级受套餐配额限制，实测追加子句会报
+`NestedRuleQuotaCheckFailed`；单独一条只有 `A and B` 一层，可正常创建。
+
+实测（2026-10-01，生产）：
+
+| 请求 | 结果 |
+|---|---|
+| `GET https://class.getastra.cn/`（UA `AstraSchedule/1.6.1`） | 200 `{"message":"Hello World"}`、`X-Astra-Edge-Root: hit`、**无** `x-fc-request-id` |
+| `HEAD https://class.getastra.cn/` | 同上（空体） |
+| `GET https://class.getastra.cn/?probe=1` | 同上 |
+| `POST https://class.getastra.cn/` | 404 `404 page not found`（`text/plain`）、`X-Astra-Edge-Root: hit`、无 `x-fc-request-id` |
+| `OPTIONS https://class.getastra.cn/` | 204 空体、`X-Astra-Edge-Root: hit`、无 `x-fc-request-id` |
+| `GET https://class.getastra.cn/web/countdown?scope=39%2F2023%2F1` | 仍到 FC（有 `x-fc-request-id`） |
+| `GET https://i.getastra.cn/`、`www.`、`go.getastra.cn/` | 仍由 Pages 作答（`X-Site-Cache-Status: HIT`） |
+| `GET https://sys.getastra.cn/`、`https://to.getastra.cn/` | 200 `{"message":"Hello World"}`、`X-Astra-Edge-Root: hit`、无 `x-fc-request-id`（原先 `sys.` 的 Hello World 与 `to.` 的 404 都来自 FC） |
+| `POST https://sys.getastra.cn/web/auth/login` | 仍到 FC（400 `{"detail":"无效参数"}`、有 `x-fc-request-id`）——API 写请求未受影响 |
 
 ## 4. 响应体为什么要「逐字同形」
 
