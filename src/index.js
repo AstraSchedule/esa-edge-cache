@@ -43,6 +43,19 @@ const EDGE_HEADER = 'X-Astra-Edge-Weather';
 const ROOT_EDGE_HEADER = 'X-Astra-Edge-Root';
 
 /**
+ * 函数变量键名：最低兼容客户端版本（形如 `202610.1.0`）。
+ * 未配置、或值不是点分纯数字时闸门整体关闭——宁可放过旧客户端，
+ * 也不能因为一个配置笔误把全量客户端挡在门外。
+ */
+const ENV_MIN_CLIENT_VERSION = 'MIN_CLIENT_VERSION';
+
+/** 标记本响应由「最低兼容客户端版本」闸门就地产出：block（版本过低，未回源） */
+const MIN_VERSION_HEADER = 'X-Astra-Edge-Min-Version';
+
+/** 闸门要求的版本号，回显在 426 上，客户端日志与排障一眼看出被拦的原因 */
+const MIN_VERSION_VALUE_HEADER = 'X-Astra-Min-Client-Version';
+
+/**
  * 根路径 `/` 的响应体，与源站 gin 根路由逐字同形
  * （usr-backend/main.go、sys-backend/router/setup.go 的 `c.JSON(200, gin.H{"message": "Hello World"})`）。
  * 连通性探测只看「通不通」，保持同形即可，客户端与监控都不用改。
@@ -92,6 +105,12 @@ export default {
 	async fetch(request, context, env) {
 		const method = String(request.method || 'GET').toUpperCase();
 
+		// 最低兼容客户端版本闸门：版本过低的客户端一律 426，连同连通性探针都不回源
+		const outdated = handleMinClientVersion(request, method, env, context);
+		if (outdated) {
+			return outdated;
+		}
+
 		// 连通性探针 `/`：任何方法都在边缘作答，绝不回源（写请求的 KV 失效逻辑也轮不到它）
 		const root = handleRoot(request, method);
 		if (root) {
@@ -128,6 +147,91 @@ export default {
 		return fetch(request);
 	},
 };
+
+/* ============ 最低兼容客户端版本闸门（旧客户端一律 426） ============ */
+
+/**
+ * 只给「客户端」判版本。客户端 UA 是 `AstraSchedule/<版本>`（desktop/main/client-ua.js 逐字生成），
+ * 返回版本串；`AstraSchedule` 没有版本号时返回空串（按 0 处理，低于任何阈值）；
+ * 不是客户端（Mozilla/Chrome、脚本、扫描器）返回 null —— 一律放行。
+ */
+function clientVersionOf(userAgent) {
+	const ua = String(userAgent || '').trim();
+	if (!/^AstraSchedule(?:\/|\s|$)/i.test(ua)) {
+		return null;
+	}
+	const matched = /^AstraSchedule\/(\S+)/i.exec(ua);
+	return matched ? matched[1] : '';
+}
+
+/** 点分数字版本 → 数字数组；任一段不是纯数字就返回 null（非法值不参与比较） */
+function versionParts(version) {
+	const parts = String(version)
+		.split('.')
+		.map((part) => (/^\d+$/.test(part) ? Number(part) : NaN));
+	return parts.length > 0 && parts.every((value) => Number.isFinite(value)) ? parts : null;
+}
+
+/**
+ * 点分数字版本比较，按段数值比而不是字符串字典序（`202609.28.150` > `202609.5.1`）；
+ * 缺段按 0 补，所以 `202610.1` 与 `202610.1.0` 视为相等。返回 1 / 0 / -1。
+ */
+function compareVersions(left, right) {
+	const length = Math.max(left.length, right.length);
+	for (let i = 0; i < length; i++) {
+		const diff = (left[i] || 0) - (right[i] || 0);
+		if (diff !== 0) {
+			return diff > 0 ? 1 : -1;
+		}
+	}
+	return 0;
+}
+
+/** 426 响应体：状态码是硬契约，其余字段是给排障的人看的 */
+function minVersionBody(min) {
+	return JSON.stringify({
+		error: '客户端版本过低，已停止提供数据：请更新到 ' + min + ' 或更高版本',
+		min_version: min,
+	});
+}
+
+/**
+ * 最低兼容客户端版本闸门：UA 里的客户端版本低于 `MIN_CLIENT_VERSION` 时，
+ * 不论方法、路径、version 参数是什么，一律就地回 426，**绝不回源**——
+ * 旧客户端只看到一次失败（自动更新照常进行，更新完成后自然恢复），
+ * 源站不会为淘汰版本的轮询/风暴付出任何 FC 实例成本。
+ *
+ * 三条边界：
+ * - 环境变量未配置或值非法 → 闸门关闭（fail-open），不因配置笔误误伤全量客户端；
+ * - 非 AstraSchedule 的 UA → 视为兼容放行（开发调试要用；这类来源在 WAF 层另有 JS 质询兜底）；
+ * - 客户端版本号缺失或含非数字段 → 按 0 处理，低于阈值即拦。
+ *
+ * 返回 null 表示放行（版本达标或不是客户端），交回 fetch 里的原流程。
+ */
+function handleMinClientVersion(request, method, env, context) {
+	const min = pickString([env, context], ENV_MIN_CLIENT_VERSION).trim();
+	const minParts = versionParts(min);
+	if (!minParts) {
+		return null;
+	}
+	const version = clientVersionOf(request.headers.get('user-agent'));
+	if (version === null) {
+		return null;
+	}
+	const parts = versionParts(version);
+	if (parts && compareVersions(parts, minParts) >= 0) {
+		return null;
+	}
+	return new Response(method === 'HEAD' ? null : minVersionBody(min), {
+		status: 426,
+		headers: {
+			'content-type': 'application/json; charset=utf-8',
+			'cache-control': 'no-store',
+			[MIN_VERSION_HEADER]: 'block',
+			[MIN_VERSION_VALUE_HEADER]: min,
+		},
+	});
+}
 
 /**
  * 根路径 `/`：源站只注册了 GET（usr-backend/main.go、sys-backend/router/setup.go），
@@ -617,7 +721,9 @@ export {
 	EDGE_HEADER,
 	ENV_API_HOST,
 	ENV_API_KEY,
+	ENV_MIN_CLIENT_VERSION,
 	KV_NAMESPACE,
+	MIN_VERSION_HEADER,
 };
 
 /* ===================== 课表版本缓存（issue desktop#63） ===================== */
