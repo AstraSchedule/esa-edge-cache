@@ -104,7 +104,7 @@ ESA 的等价物是运行时的 `request.info`，实测形态：
 - 以上所有分支都带标记头 `X-Astra-Edge-Root: hit`（值只会是 `hit`），且**都不回源**。
 - 带查询串的 `/`（如 `/?probe=1`）同样接管；只有非 `/` 的路径返回 `null` 交回原流程。
 
-为什么连 `POST /` 也不放回源：路由规则本身把 `http.request.uri == "/"` 的请求全量送进函数，
+为什么连 `POST /` 也不放回源：路由规则本身把 `http.request.uri.path == "/"` 的请求全量送进函数，
 再放回去等于白拉一次 FC；而且写请求会先经过 `handleMutating`，等于为一句探针顺带跑一遍 KV 失效。
 各方法的响应按**实测到的源站行为**镜像：源站只注册了 `GET /`，gin 按方法建路由树，`HEAD /` 与
 `POST`/`PUT`/`DELETE /` 实际是 404（`text/plain`，18 字节），`OPTIONS /` 由 CORS 中间件回 204。
@@ -120,8 +120,10 @@ ESA 的等价物是运行时的 `request.info`，实测形态：
 Sequence 2，`RouteEnable on`）：
 
 ```
-not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri == "/"
+not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri.path == "/"
 ```
+
+> 字段选择：用 `http.request.uri.path`（只含路径）而不是 `http.request.uri`（阿里云文档口径为「路径 + 查询串」）。2026-10-01 实测 `http.request.uri == "/"` 在 ESA 函数路由里也能匹配 `/?probe=1`（`sys.`/`to.` 上带 `AstraSchedule` UA 仍回 `X-Astra-Edge-Root: hit`，而这两个域名被天气那条规则整体排除，POST `/web/auth/login` 又确实仍到 FC，说明函数只能从本路由进来），但既然文档把 `.path` 定义为纯路径，就用 `.path` 明示意图，不依赖等值比较的实现细节。
 
 这条的黑名单比天气那条少两个（少了 `sys.getastra.cn` 与 `to.getastra.cn`）：天气那条含「非
 GET/OPTIONS → 进函数」的子句，必须把这两个纯 API 域名排除掉，否则会劫持它们的写请求；根路径

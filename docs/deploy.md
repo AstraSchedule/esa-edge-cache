@@ -98,7 +98,7 @@ aliyun esa ListRoutineRoutes --region cn-hangzhou --RoutineName esa-edge-cache
 aliyun esa CreateRoutineRoute --region cn-hangzhou --SiteId 178107369359596 \
   --RoutineName esa-edge-cache --RouteName edge-root-probe --RouteEnable on --Fallback on \
   --Sequence 2 \
-  --Rule 'not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri == "/"'
+  --Rule 'not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri.path == "/"'
 ```
 
 **为什么单独一条**：单条规则的嵌套层级受套餐配额限制，实测往天气规则里追加 `/` 子句会报
