@@ -120,8 +120,13 @@ ESA 的等价物是运行时的 `request.info`，实测形态：
 Sequence 2，`RouteEnable on`）：
 
 ```
-not http.host in {<Pages 域名黑名单>} and http.request.uri == "/"
+not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri == "/"
 ```
+
+这条的黑名单比天气那条少两个（少了 `sys.getastra.cn` 与 `to.getastra.cn`）：天气那条含「非
+GET/OPTIONS → 进函数」的子句，必须把这两个纯 API 域名排除掉，否则会劫持它们的写请求；根路径
+规则只匹配 `/`，不存在这个问题。于是 API 域名（`class.`/`sys.`/`to.`/`njx.`/`sandbox.`/`kuohu.`）的
+`/` 全部由边缘作答，只有 Pages 托管的五个域名继续交给 Pages。
 
 **为什么不并进天气那条规则**：单条规则的嵌套层级受套餐配额限制，实测追加子句会报
 `NestedRuleQuotaCheckFailed`；单独一条只有 `A and B` 一层，可正常创建。
@@ -137,7 +142,8 @@ not http.host in {<Pages 域名黑名单>} and http.request.uri == "/"
 | `OPTIONS https://class.getastra.cn/` | 204 空体、`X-Astra-Edge-Root: hit`、无 `x-fc-request-id` |
 | `GET https://class.getastra.cn/web/countdown?scope=39%2F2023%2F1` | 仍到 FC（有 `x-fc-request-id`） |
 | `GET https://i.getastra.cn/`、`www.`、`go.getastra.cn/` | 仍由 Pages 作答（`X-Site-Cache-Status: HIT`） |
-| `GET https://to.getastra.cn/` | host 在黑名单内 → 仍 FC 404（行为未变） |
+| `GET https://sys.getastra.cn/`、`https://to.getastra.cn/` | 200 `{"message":"Hello World"}`、`X-Astra-Edge-Root: hit`、无 `x-fc-request-id`（原先 `sys.` 的 Hello World 与 `to.` 的 404 都来自 FC） |
+| `POST https://sys.getastra.cn/web/auth/login` | 仍到 FC（400 `{"detail":"无效参数"}`、有 `x-fc-request-id`）——API 写请求未受影响 |
 
 ## 4. 响应体为什么要「逐字同形」
 

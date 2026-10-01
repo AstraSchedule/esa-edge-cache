@@ -98,19 +98,23 @@ aliyun esa ListRoutineRoutes --region cn-hangzhou --RoutineName esa-edge-cache
 aliyun esa CreateRoutineRoute --region cn-hangzhou --SiteId 178107369359596 \
   --RoutineName esa-edge-cache --RouteName edge-root-probe --RouteEnable on --Fallback on \
   --Sequence 2 \
-  --Rule 'not http.host in {<黑名单域名>} and http.request.uri == "/"'
+  --Rule 'not http.host in {"getastra.cn" "www.getastra.cn" "i.getastra.cn" "dev.getastra.cn" "go.getastra.cn"} and http.request.uri == "/"'
 ```
 
 **为什么单独一条**：单条规则的嵌套层级受套餐配额限制，实测往天气规则里追加 `/` 子句会报
 `NestedRuleQuotaCheckFailed: The nesting level of rules allowed by the plan failed to be verified`；
 单独一条只有 `A and B` 一层嵌套，可以正常创建。
 
+根路径这条的黑名单只排 Pages 托管的五个域名（apex / `www.` / `i.` / `dev.` / `go.`），比天气那条少了
+`sys.getastra.cn` 与 `to.getastra.cn`：天气规则含「非 GET/OPTIONS → 进函数」，必须排除这两个纯 API
+域名以免劫持写请求；根路径只匹配 `/`，于是 API 域名的 `/` 也一并由边缘作答，不再拉 FC。
+
 线上现在两条路由（都 `Mode custom`、`Fallback on`、`RouteEnable on`）：
 
 | ConfigId | RouteName | Sequence | 作用 |
 |---|---|---|---|
 | `521112930863104` | `edge-weather-class` | 1 | 天气 + 课表版本读写 + 非 GET + UA `AstraSchedule` |
-| `522037019918336` | `edge-root-probe` | 2 | `/`（任何方法）：边缘作答，不拉 FC（`GET` Hello World / `HEAD` 200 空体 / `OPTIONS` 204 / 其余 404）|
+| `522037019918336` | `edge-root-probe` | 2 | API 域名的 `/`（任何方法）边缘作答，不拉 FC（`GET` Hello World / `HEAD` 200 空体 / `OPTIONS` 204 / 其余 404）；Pages 域名由 Pages 作答 |
 
 ### 覆盖范围与排除项
 
@@ -171,6 +175,8 @@ curl -sS -D - -X POST --data '{}' -A "AstraSchedule/1.6.1" "https://class.getast
 | `class.getastra.cn/`（UA `AstraSchedule/1.6.1`） | `200 {"message":"Hello World"}` + `X-Astra-Edge-Root: hit`，无 `x-fc-request-id`（边缘作答） |
 | `class.getastra.cn/`（`POST`） | `404 404 page not found`（`text/plain`，18 字节）+ `X-Astra-Edge-Root: hit`，无 `x-fc-request-id`（边缘作答） |
 | `class.getastra.cn/`（`OPTIONS`） | `204` 空体 + `X-Astra-Edge-Root: hit`，无 `x-fc-request-id`（边缘作答） |
+| `sys.getastra.cn/`、`to.getastra.cn/`（`GET`） | `200 {"message":"Hello World"}` + `X-Astra-Edge-Root: hit`，无 `x-fc-request-id`（原先这两条都来自 FC） |
+| `sys.getastra.cn/web/auth/login`（`POST`） | 仍到 FC（有 `x-fc-request-id`）——API 未受影响 |
 | KV | 出现 `w1.5YyX5Lqs.`（北京）、`w1.TmFuamluZw.`（Nanjing）等键 |
 
 ## 6. 回滚
@@ -199,5 +205,5 @@ aliyun esa DeleteRoutineRoute --region cn-hangzhou \
 | `/api/weather/` 返回 400「无法从客户端 IP 定位城市…」 | 这是**边缘自己**答的：检查 `request.info` 是否有 `ip_city_en`（用预览地址打一次即可看到）|
 | `/api/weather/` 返回源站那句 400「请确保请求经过 Cloudflare」或「未配置天气认证信息：请配置 JWT」 | 说明请求根本没进函数：路由没命中该 host，或直接打到了源站 |
 | 课表读一直 `miss`、每次回源 | 边缘 KV 最终一致（最长 300 秒）；再不行看 `ListKvs --Namespace astra --Prefix s1.` 里的条目是否存在、数据版本/教学周是否与客户端带来的串一致（第三段不参与判定，写法差异不会再导致 miss）|
-| `/` 回 Hello World 但没有 `X-Astra-Edge-Root` | 请求没进函数：`edge-root-probe` 那条路由是否 `RouteEnable on`、host 是否落在黑名单里（黑名单内的域名根路径仍回源） |
+| `/` 回 Hello World 但没有 `X-Astra-Edge-Root` | 请求没进函数：`edge-root-probe` 那条路由是否 `RouteEnable on`；host 是否属于 Pages 托管的五个域名（它们的 `/` 由 Pages 作答，本就不该有该头） |
 | 课表读出现 `revalidated` | 源站又回到了「用第三段判定 304」的旧版本（回源带的是 version=0，正常必得 200）：先看源站部署版本 |
